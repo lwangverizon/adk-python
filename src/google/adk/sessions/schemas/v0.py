@@ -303,38 +303,39 @@ class StorageEvent(Base):
     return storage_event
 
   def to_event(self) -> Event:
+    actions_data = self.actions if isinstance(self.actions, dict) else self.actions
     return Event(
-        id=self.id,
-        invocation_id=self.invocation_id,
-        author=self.author,
-        branch=self.branch,
-        # This is needed as previous ADK version pickled actions might not have
-        # value defined in the current version of the EventActions model.
-        actions=EventActions().model_copy(update=self.actions.model_dump()),
-        timestamp=self.timestamp.timestamp(),
-        long_running_tool_ids=self.long_running_tool_ids,
-        partial=self.partial,
-        turn_complete=self.turn_complete,
-        error_code=self.error_code,
-        error_message=self.error_message,
-        interrupted=self.interrupted,
-        custom_metadata=self.custom_metadata,
-        content=_session_util.decode_model(self.content, types.Content),
-        grounding_metadata=_session_util.decode_model(
-            self.grounding_metadata, types.GroundingMetadata
-        ),
-        usage_metadata=_session_util.decode_model(
-            self.usage_metadata, types.GenerateContentResponseUsageMetadata
-        ),
-        citation_metadata=_session_util.decode_model(
-            self.citation_metadata, types.CitationMetadata
-        ),
-        input_transcription=_session_util.decode_model(
-            self.input_transcription, types.Transcription
-        ),
-        output_transcription=_session_util.decode_model(
-            self.output_transcription, types.Transcription
-        ),
+      id=self.id,
+      invocation_id=self.invocation_id,
+      author=self.author,
+      branch=self.branch,
+      # This is needed as previous ADK version pickled actions might not have
+      # value defined in the current version of the EventActions model.
+      actions=EventActions.model_validate(actions_data) if actions_data else None,
+      timestamp=self.timestamp.timestamp(),
+      long_running_tool_ids=self.long_running_tool_ids,
+      partial=self.partial,
+      turn_complete=self.turn_complete,
+      error_code=self.error_code,
+      error_message=self.error_message,
+      interrupted=self.interrupted,
+      custom_metadata=self.custom_metadata,
+      content=_session_util.decode_model(self.content, types.Content),
+      grounding_metadata=_session_util.decode_model(
+          self.grounding_metadata, types.GroundingMetadata
+      ),
+      usage_metadata=_session_util.decode_model(
+          self.usage_metadata, types.GenerateContentResponseUsageMetadata
+      ),
+      citation_metadata=_session_util.decode_model(
+          self.citation_metadata, types.CitationMetadata
+      ),
+      input_transcription=_session_util.decode_model(
+          self.input_transcription, types.Transcription
+      ),
+      output_transcription=_session_util.decode_model(
+          self.output_transcription, types.Transcription
+      ),
     )
 
 
