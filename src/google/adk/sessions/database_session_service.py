@@ -305,15 +305,13 @@ class DatabaseSessionService(BaseSessionService):
           schema.StorageSession, (app_name, user_id, session_id)
       )
       if storage_session is None:
-        await self.create_session(
+        session = await self.create_session(
           app_name=app_name,
           user_id=user_id,
           session_id=session_id,
         )
-        storage_session = await sql_session.get(
-            schema.StorageSession, (app_name, user_id, session_id)
-        )
-
+        return session
+      
       stmt = (
           select(schema.StorageEvent)
           .filter(schema.StorageEvent.app_name == app_name)
