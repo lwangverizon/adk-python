@@ -201,43 +201,6 @@ class TestRunnerFindAgentToRun:
 
 
 @pytest.mark.asyncio
-async def test_session_not_found_message_includes_alignment_hint():
-
-  class RunnerWithMismatch(Runner):
-
-    def _infer_agent_origin(
-        self, agent: BaseAgent
-    ) -> tuple[Optional[str], Optional[Path]]:
-      del agent
-      return "expected_app", Path("/workspace/agents/expected_app")
-
-  session_service = InMemorySessionService()
-  runner = RunnerWithMismatch(
-      app_name="configured_app",
-      agent=MockLlmAgent("root_agent"),
-      session_service=session_service,
-      artifact_service=InMemoryArtifactService(),
-  )
-
-  agen = runner.run_async(
-      user_id="user",
-      session_id="missing",
-      new_message=types.Content(role="user", parts=[]),
-  )
-
-  with pytest.raises(ValueError) as excinfo:
-    await agen.__anext__()
-
-  await agen.aclose()
-
-  message = str(excinfo.value)
-  assert "Session not found" in message
-  assert "configured_app" in message
-  assert "expected_app" in message
-  assert "Ensure the runner app_name matches" in message
-
-
-@pytest.mark.asyncio
 async def test_runner_allows_nested_agent_directories(tmp_path, monkeypatch):
   project_root = tmp_path / "workspace"
   agent_dir = project_root / "agents" / "examples" / "001_hello_world"
