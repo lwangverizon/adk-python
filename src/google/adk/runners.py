@@ -454,8 +454,9 @@ class Runner:
             app_name=self.app_name, user_id=user_id, session_id=session_id
         )
         if not session:
-          message = self._format_session_not_found_message(session_id)
-          raise ValueError(message)
+          session = await self.session_service.create_session(
+              app_name=self.app_name, user_id=user_id, session_id=session_id
+          )
         if not invocation_id and not new_message:
           raise ValueError(
               'Running an agent requires either a new_message or an '
