@@ -534,9 +534,9 @@ class Runner:
         app_name=self.app_name, user_id=user_id, session_id=session_id
     )
     if not session:
-        session = await self.session_service.create_session(
-            app_name=self.app_name, user_id=user_id, session_id=session_id
-        )
+      session = await self.session_service.create_session(
+          app_name=self.app_name, user_id=user_id, session_id=session_id
+      )
     rewind_event_index = -1
     for i, event in enumerate(session.events):
       if event.invocation_id == rewind_before_invocation_id:
