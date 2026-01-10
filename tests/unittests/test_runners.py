@@ -201,6 +201,39 @@ class TestRunnerFindAgentToRun:
 
 
 @pytest.mark.asyncio
+async def test_session_auto_creation():
+
+  class RunnerWithMismatch(Runner):
+
+    def _infer_agent_origin(
+        self, agent: BaseAgent
+    ) -> tuple[Optional[str], Optional[Path]]:
+      del agent
+      return "expected_app", Path("/workspace/agents/expected_app")
+
+  session_service = InMemorySessionService()
+  runner = RunnerWithMismatch(
+      app_name="expected_app",
+      agent=MockLlmAgent("test_agent"),
+      session_service=session_service,
+      artifact_service=InMemoryArtifactService(),
+  )
+
+  agen = runner.run_async(
+      user_id="user",
+      session_id="missing",
+      new_message=types.Content(role="user", parts=[types.Part(text="hi")]),
+  )
+
+  event = await agen.__anext__()
+  await agen.aclose()
+
+  # Verify that session_id="missing" doesn't error out - session is auto-created
+  assert event.author == "test_agent"
+  assert event.content.parts[0].text == "Test LLM response"
+
+
+@pytest.mark.asyncio
 async def test_runner_allows_nested_agent_directories(tmp_path, monkeypatch):
   project_root = tmp_path / "workspace"
   agent_dir = project_root / "agents" / "examples" / "001_hello_world"
