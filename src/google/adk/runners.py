@@ -348,7 +348,9 @@ class Runner:
       return message
     return (
         f'{message}. {self._app_name_alignment_hint} '
-        'The mismatch prevents the runner from locating the session.'
+        'The mismatch prevents the runner from locating the session. '
+        'To automatically create a session when missing, set '
+        'auto_create_session=True when constructing the runner.'
     )
 
   def run(
