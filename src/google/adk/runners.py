@@ -149,6 +149,7 @@ class Runner:
       memory_service: Optional[BaseMemoryService] = None,
       credential_service: Optional[BaseCredentialService] = None,
       plugin_close_timeout: float = 5.0,
+      auto_create_session: bool = False,
   ):
     """Initializes the Runner.
 
@@ -175,6 +176,9 @@ class Runner:
         memory_service: The memory service for the runner.
         credential_service: The credential service for the runner.
         plugin_close_timeout: The timeout in seconds for plugin close methods.
+        auto_create_session: Whether to automatically create a session when
+          not found. Defaults to False. If False, a missing session raises
+          ValueError with a helpful message.
 
     Raises:
         ValueError: If `app` is provided along with `agent` or `plugins`, or if
@@ -195,6 +199,7 @@ class Runner:
     self.plugin_manager = PluginManager(
         plugins=plugins, close_timeout=plugin_close_timeout
     )
+    self.auto_create_session = auto_create_session
     (
         self._agent_origin_app_name,
         self._agent_origin_dir,
@@ -459,9 +464,13 @@ class Runner:
             app_name=self.app_name, user_id=user_id, session_id=session_id
         )
         if not session:
-          session = await self.session_service.create_session(
-              app_name=self.app_name, user_id=user_id, session_id=session_id
-          )
+          if self.auto_create_session:
+            session = await self.session_service.create_session(
+                app_name=self.app_name, user_id=user_id, session_id=session_id
+            )
+          else:
+            message = self._format_session_not_found_message(session_id)
+            raise ValueError(message)
         if not invocation_id and not new_message:
           raise ValueError(
               'Running an agent requires either a new_message or an '
@@ -539,9 +548,13 @@ class Runner:
         app_name=self.app_name, user_id=user_id, session_id=session_id
     )
     if not session:
-      session = await self.session_service.create_session(
-          app_name=self.app_name, user_id=user_id, session_id=session_id
-      )
+      if self.auto_create_session:
+        session = await self.session_service.create_session(
+            app_name=self.app_name, user_id=user_id, session_id=session_id
+        )
+      else:
+        message = self._format_session_not_found_message(session_id)
+        raise ValueError(message)
     rewind_event_index = -1
     for i, event in enumerate(session.events):
       if event.invocation_id == rewind_before_invocation_id:
@@ -973,9 +986,13 @@ class Runner:
           app_name=self.app_name, user_id=user_id, session_id=session_id
       )
       if not session:
-        session = await self.session_service.create_session(
-            app_name=self.app_name, user_id=user_id, session_id=session_id
-        )
+        if self.auto_create_session:
+          session = await self.session_service.create_session(
+              app_name=self.app_name, user_id=user_id, session_id=session_id
+          )
+        else:
+          message = self._format_session_not_found_message(session_id)
+          raise ValueError(message)
     invocation_context = self._new_invocation_context_for_live(
         session,
         live_request_queue=live_request_queue,
@@ -1188,9 +1205,13 @@ class Runner:
         app_name=self.app_name, user_id=user_id, session_id=session_id
     )
     if not session:
-      session = await self.session_service.create_session(
-          app_name=self.app_name, user_id=user_id, session_id=session_id
-      )
+      if self.auto_create_session:
+        session = await self.session_service.create_session(
+            app_name=self.app_name, user_id=user_id, session_id=session_id
+        )
+      else:
+        message = self._format_session_not_found_message(session_id)
+        raise ValueError(message)
       if not quiet:
         print(f'\n ### Created new session: {session_id}')
     elif not quiet:
