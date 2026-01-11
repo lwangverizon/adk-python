@@ -1205,13 +1205,9 @@ class Runner:
         app_name=self.app_name, user_id=user_id, session_id=session_id
     )
     if not session:
-      if self.auto_create_session:
-        session = await self.session_service.create_session(
-            app_name=self.app_name, user_id=user_id, session_id=session_id
-        )
-      else:
-        message = self._format_session_not_found_message(session_id)
-        raise ValueError(message)
+      session = await self.session_service.create_session(
+          app_name=self.app_name, user_id=user_id, session_id=session_id
+      )
       if not quiet:
         print(f'\n ### Created new session: {session_id}')
     elif not quiet:
