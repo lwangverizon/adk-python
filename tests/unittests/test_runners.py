@@ -68,6 +68,24 @@ class MockAgent(BaseAgent):
     )
 
 
+class MockLiveAgent(BaseAgent):
+  """Mock live agent for unit testing."""
+
+  def __init__(self, name: str):
+    super().__init__(name=name, sub_agents=[])
+
+  async def _run_live_impl(
+      self, invocation_context: InvocationContext
+  ) -> AsyncGenerator[Event, None]:
+    yield Event(
+        invocation_id=invocation_context.invocation_id,
+        author=self.name,
+        content=types.Content(
+            role="model", parts=[types.Part(text="live hello")]
+        ),
+    )
+
+
 class MockLlmAgent(LlmAgent):
   """Mock LLM agent for unit testing."""
 
@@ -269,6 +287,75 @@ async def test_session_auto_creation():
   # Verify that session_id="missing" doesn't error out - session is auto-created
   assert event.author == "test_agent"
   assert event.content.parts[0].text == "Test LLM response"
+
+
+@pytest.mark.asyncio
+async def test_rewind_auto_create_session_on_missing_session():
+  """When auto_create_session=True, rewind should create session if missing.
+
+  The newly created session won't contain the target invocation, so
+  `rewind_async` should raise an Invocation ID not found error (rather than
+  a session not found error), demonstrating auto-creation occurred.
+  """
+  session_service = InMemorySessionService()
+  runner = Runner(
+      app_name="auto_create_app",
+      agent=MockLlmAgent("agent_for_rewind"),
+      session_service=session_service,
+      artifact_service=InMemoryArtifactService(),
+      auto_create_session=True,
+  )
+
+  with pytest.raises(ValueError, match=r"Invocation ID not found: inv_missing"):
+    await runner.rewind_async(
+        user_id="user",
+        session_id="missing",
+        rewind_before_invocation_id="inv_missing",
+    )
+
+  # Verify the session actually exists now due to auto-creation.
+  session = await session_service.get_session(
+      app_name="auto_create_app", user_id="user", session_id="missing"
+  )
+  assert session is not None
+  assert session.app_name == "auto_create_app"
+
+
+@pytest.mark.asyncio
+async def test_run_live_auto_create_session():
+  """run_live should auto-create session when missing and yield events."""
+  session_service = InMemorySessionService()
+  artifact_service = InMemoryArtifactService()
+  runner = Runner(
+      app_name="live_app",
+      agent=MockLiveAgent("live_agent"),
+      session_service=session_service,
+      artifact_service=artifact_service,
+      auto_create_session=True,
+  )
+
+  # An empty LiveRequestQueue is sufficient for our mock agent.
+  from google.adk.agents.live_request_queue import LiveRequestQueue
+
+  live_queue = LiveRequestQueue()
+
+  agen = runner.run_live(
+      user_id="user",
+      session_id="missing",
+      live_request_queue=live_queue,
+  )
+
+  event = await agen.__anext__()
+  await agen.aclose()
+
+  assert event.author == "live_agent"
+  assert event.content.parts[0].text == "live hello"
+
+  # Session should have been created automatically.
+  session = await session_service.get_session(
+      app_name="live_app", user_id="user", session_id="missing"
+  )
+  assert session is not None
 
 
 @pytest.mark.asyncio
