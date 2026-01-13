@@ -432,3 +432,51 @@ class TestGoogleSearchTool:
       assert len(llm_request.config.tools) == 1
       assert llm_request.config.tools[0].google_search is not None
       assert llm_request.config.tools[0].google_search_retrieval is None
+
+  @pytest.mark.asyncio
+  async def test_process_llm_request_with_custom_model_parameter(self):
+    """Test that custom model parameter overrides the llm_request model."""
+    # Create tool with custom model
+    tool = GoogleSearchTool(model='gemini-2.0-flash')
+    tool_context = await _create_tool_context()
+
+    # LLM request with a different model (Gemini 1.x)
+    llm_request = LlmRequest(
+        model='gemini-1.5-flash', config=types.GenerateContentConfig()
+    )
+
+    await tool.process_llm_request(
+        tool_context=tool_context, llm_request=llm_request
+    )
+
+    # Verify that the model was overridden to gemini-2.0-flash
+    assert llm_request.model == 'gemini-2.0-flash'
+    # Verify that google_search is used (Gemini 2.x behavior)
+    assert llm_request.config.tools is not None
+    assert len(llm_request.config.tools) == 1
+    assert llm_request.config.tools[0].google_search is not None
+    assert llm_request.config.tools[0].google_search_retrieval is None
+
+  @pytest.mark.asyncio
+  async def test_process_llm_request_without_custom_model_parameter(self):
+    """Test that without custom model parameter, original model is used."""
+    # Create tool without custom model
+    tool = GoogleSearchTool()
+    tool_context = await _create_tool_context()
+
+    # LLM request with Gemini 1.x model
+    llm_request = LlmRequest(
+        model='gemini-1.5-flash', config=types.GenerateContentConfig()
+    )
+
+    await tool.process_llm_request(
+        tool_context=tool_context, llm_request=llm_request
+    )
+
+    # Verify that the model was not changed
+    assert llm_request.model == 'gemini-1.5-flash'
+    # Verify that google_search_retrieval is used (Gemini 1.x behavior)
+    assert llm_request.config.tools is not None
+    assert len(llm_request.config.tools) == 1
+    assert llm_request.config.tools[0].google_search_retrieval is not None
+    assert llm_request.config.tools[0].google_search is None
