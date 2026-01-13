@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import copy
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 import logging
 from typing import Any
@@ -97,10 +98,24 @@ class _SchemaClasses:
 
 
 class DatabaseSessionService(BaseSessionService):
-  """A session service that uses a database for storage."""
+  """A session service that uses a database for storage.
+  
+  Attributes:
+    ttl_seconds: Optional time-to-live in seconds for sessions. If set,
+      sessions older than this value will be automatically excluded from
+      get_session and list_sessions operations, and can be cleaned up
+      using cleanup_expired_sessions().
+  """
 
-  def __init__(self, db_url: str, **kwargs: Any):
-    """Initializes the database session service with a database URL."""
+  def __init__(self, db_url: str, ttl_seconds: Optional[int] = None, **kwargs: Any):
+    """Initializes the database session service with a database URL.
+    
+    Args:
+      db_url: The database connection URL.
+      ttl_seconds: Optional time-to-live in seconds for sessions. Sessions
+        older than this value will be considered expired.
+      **kwargs: Additional keyword arguments passed to create_async_engine.
+    """
     # 1. Create DB engine for db connection
     # 2. Create all tables based on schema
     # 3. Initialize all properties
@@ -154,8 +169,31 @@ class DatabaseSessionService(BaseSessionService):
     # Lock to ensure thread-safe schema version check
     self._db_schema_lock = asyncio.Lock()
 
+    # TTL in seconds for session expiration
+    self.ttl_seconds = ttl_seconds
+
   def _get_schema_classes(self) -> _SchemaClasses:
     return _SchemaClasses(self._db_schema_version)
+
+  def _is_session_expired(self, session_update_time: datetime) -> bool:
+    """Check if a session is expired based on TTL.
+    
+    Args:
+      session_update_time: The last update time of the session.
+      
+    Returns:
+      True if the session is expired, False otherwise.
+    """
+    if self.ttl_seconds is None:
+      return False
+    
+    now = datetime.now(timezone.utc)
+    # Handle both timezone-aware and naive datetimes
+    if session_update_time.tzinfo is None:
+      session_update_time = session_update_time.replace(tzinfo=timezone.utc)
+    
+    age_seconds = (now - session_update_time).total_seconds()
+    return age_seconds > self.ttl_seconds
 
   async def _prepare_tables(self):
     """Ensure database tables are ready for use.
@@ -308,9 +346,27 @@ class DatabaseSessionService(BaseSessionService):
     # 3. Convert and return the session
     schema = self._get_schema_classes()
     async with self.database_session_factory() as sql_session:
-      storage_session = await sql_session.get(
-          schema.StorageSession, (app_name, user_id, session_id)
-      )
+      # Use SQL query with TTL filter for optimal performance
+      if self.ttl_seconds is not None:
+        # Query with TTL check - filters expired sessions in SQL
+        expiration_threshold = datetime.now(timezone.utc) - timedelta(
+            seconds=self.ttl_seconds
+        )
+        stmt = (
+            select(schema.StorageSession)
+            .filter(schema.StorageSession.app_name == app_name)
+            .filter(schema.StorageSession.user_id == user_id)
+            .filter(schema.StorageSession.id == session_id)
+            .filter(schema.StorageSession.update_time > expiration_threshold)
+        )
+        result = await sql_session.execute(stmt)
+        storage_session = result.scalars().first()
+      else:
+        # Fast path when TTL is disabled - use direct get
+        storage_session = await sql_session.get(
+            schema.StorageSession, (app_name, user_id, session_id)
+        )
+      
       if storage_session is None:
         return None
 
@@ -365,6 +421,15 @@ class DatabaseSessionService(BaseSessionService):
       )
       if user_id is not None:
         stmt = stmt.filter(schema.StorageSession.user_id == user_id)
+      
+      # Filter out expired sessions at SQL level for performance
+      if self.ttl_seconds is not None:
+        expiration_threshold = datetime.now(timezone.utc) - timedelta(
+            seconds=self.ttl_seconds
+        )
+        stmt = stmt.filter(
+            schema.StorageSession.update_time > expiration_threshold
+        )
 
       result = await sql_session.execute(stmt)
       results = result.scalars().all()
@@ -394,6 +459,15 @@ class DatabaseSessionService(BaseSessionService):
 
       sessions = []
       for storage_session in results:
+        # Skip expired sessions
+        if self._is_session_expired(storage_session.update_time):
+          logger.debug(
+              "Skipping expired session %s (TTL: %s seconds)",
+              storage_session.id,
+              self.ttl_seconds,
+          )
+          continue
+        
         session_state = storage_session.state
         user_state = user_states_map.get(storage_session.user_id, {})
         merged_state = _merge_state(app_state, user_state, session_state)
@@ -484,6 +558,51 @@ class DatabaseSessionService(BaseSessionService):
     # Also update the in-memory session
     await super().append_event(session=session, event=event)
     return event
+
+  async def cleanup_expired_sessions(self) -> int:
+    """Delete expired sessions from the database.
+    
+    This method physically removes sessions that have exceeded their TTL
+    from the database. Sessions are considered expired if their update_time
+    is older than ttl_seconds.
+    
+    Returns:
+      The number of sessions deleted.
+      
+    Raises:
+      ValueError: If ttl_seconds is not configured.
+    """
+    if self.ttl_seconds is None:
+      raise ValueError(
+          "Cannot cleanup expired sessions: ttl_seconds is not configured"
+      )
+    
+    await self._prepare_tables()
+    schema = self._get_schema_classes()
+    
+    # Calculate expiration cutoff time
+    now = datetime.now(timezone.utc)
+    cutoff_time = now - timedelta(seconds=self.ttl_seconds)
+    
+    async with self.database_session_factory() as sql_session:
+      # For SQLite, we need to use naive datetime
+      if sql_session.bind.dialect.name == "sqlite":
+        cutoff_time = cutoff_time.replace(tzinfo=None)
+      
+      # Delete expired sessions
+      stmt = delete(schema.StorageSession).where(
+          schema.StorageSession.update_time < cutoff_time
+      )
+      result = await sql_session.execute(stmt)
+      deleted_count = result.rowcount
+      await sql_session.commit()
+      
+      logger.info(
+          "Cleaned up %d expired sessions (TTL: %s seconds)",
+          deleted_count,
+          self.ttl_seconds,
+      )
+      return deleted_count
 
   async def close(self) -> None:
     """Disposes the SQLAlchemy engine and closes pooled connections."""
