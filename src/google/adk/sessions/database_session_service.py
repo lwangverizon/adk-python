@@ -419,34 +419,72 @@ class DatabaseSessionService(BaseSessionService):
   async def clone_session(
       self,
       *,
-      session: Session,
-      dst_user_id: Optional[str] = None,
-      dst_session_id: Optional[str] = None,
+      app_name: str,
+      src_user_id: str,
+      src_session_id: Optional[str] = None,
+      new_user_id: Optional[str] = None,
+      new_session_id: Optional[str] = None,
   ) -> Session:
     await self._prepare_tables()
 
     # Use source values as defaults
-    dst_user_id = dst_user_id or session.user_id
+    new_user_id = new_user_id or src_user_id
 
-    # Create the new session (without state to avoid side effects on app/user
-    # state)
+    # Collect source sessions and their events
+    source_sessions = []
+    if src_session_id:
+      # Single session clone
+      session = await self.get_session(
+          app_name=app_name,
+          user_id=src_user_id,
+          session_id=src_session_id,
+      )
+      if not session:
+        raise ValueError(
+            f"Source session {src_session_id} not found for user"
+            f" {src_user_id}."
+        )
+      source_sessions.append(session)
+    else:
+      # All sessions clone - get all sessions for the user
+      list_response = await self.list_sessions(
+          app_name=app_name, user_id=src_user_id
+      )
+      if not list_response.sessions:
+        raise ValueError(f"No sessions found for user {src_user_id}.")
+      # Fetch each session with events
+      for sess in list_response.sessions:
+        full_session = await self.get_session(
+            app_name=app_name,
+            user_id=src_user_id,
+            session_id=sess.id,
+        )
+        if full_session:
+          source_sessions.append(full_session)
+
+    # Merge states from all source sessions
+    merged_state = {}
+    for session in source_sessions:
+      merged_state.update(copy.deepcopy(session.state))
+
+    # Create the new session (new_session_id=None triggers UUID4 generation)
     new_session = await self.create_session(
-        app_name=session.app_name,
-        user_id=dst_user_id,
-        state=copy.deepcopy(session.state),
-        session_id=dst_session_id,
+        app_name=app_name,
+        user_id=new_user_id,
+        state=merged_state,
+        session_id=new_session_id,
     )
 
-    # Copy all events from source to destination
+    # Copy all events from all source sessions to the new session
     schema = self._get_schema_classes()
     async with self.database_session_factory() as sql_session:
-      for event in session.events:
-        # Create a deep copy of the event and assign new IDs
-        cloned_event = copy.deepcopy(event)
-        new_storage_event = schema.StorageEvent.from_event(
-            new_session, cloned_event
-        )
-        sql_session.add(new_storage_event)
+      for session in source_sessions:
+        for event in session.events:
+          cloned_event = copy.deepcopy(event)
+          new_storage_event = schema.StorageEvent.from_event(
+              new_session, cloned_event
+          )
+          sql_session.add(new_storage_event)
 
       await sql_session.commit()
 

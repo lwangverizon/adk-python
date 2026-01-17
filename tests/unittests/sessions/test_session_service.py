@@ -607,7 +607,7 @@ async def test_partial_events_are_not_persisted(session_service):
 
 @pytest.mark.asyncio
 async def test_clone_session_basic(session_service):
-  """Test basic clone_session functionality."""
+  """Test basic clone_session functionality with specific session_id."""
   app_name = 'my_app'
   user_id = 'user'
 
@@ -620,18 +620,19 @@ async def test_clone_session_basic(session_service):
   await session_service.append_event(source_session, event1)
   await session_service.append_event(source_session, event2)
 
-  # Clone the session
-  source_session = await session_service.get_session(
-      app_name=app_name, user_id=user_id, session_id=source_session.id
+  # Clone the session using source identifiers
+  cloned_session = await session_service.clone_session(
+      app_name=app_name,
+      src_user_id=user_id,
+      src_session_id=source_session.id,
   )
-  cloned_session = await session_service.clone_session(session=source_session)
 
   # Verify the cloned session
   assert cloned_session is not None
   assert cloned_session.id != source_session.id
-  assert cloned_session.app_name == source_session.app_name
-  assert cloned_session.user_id == source_session.user_id
-  assert cloned_session.state == source_session.state
+  assert cloned_session.app_name == app_name
+  assert cloned_session.user_id == user_id
+  assert cloned_session.state == {'key': 'value'}
   assert len(cloned_session.events) == 2
   assert cloned_session.events[0].invocation_id == event1.invocation_id
   assert cloned_session.events[1].invocation_id == event2.invocation_id
@@ -652,16 +653,16 @@ async def test_clone_session_with_different_user_id(session_service):
   await session_service.append_event(source_session, event)
 
   # Clone to different user
-  source_session = await session_service.get_session(
-      app_name=app_name, user_id=source_user_id, session_id=source_session.id
-  )
   cloned_session = await session_service.clone_session(
-      session=source_session, dst_user_id=dest_user_id
+      app_name=app_name,
+      src_user_id=source_user_id,
+      src_session_id=source_session.id,
+      new_user_id=dest_user_id,
   )
 
   # Verify
   assert cloned_session.user_id == dest_user_id
-  assert cloned_session.app_name == source_session.app_name
+  assert cloned_session.app_name == app_name
   assert len(cloned_session.events) == 1
 
   # Verify the cloned session is persisted correctly
@@ -687,11 +688,11 @@ async def test_clone_session_with_custom_session_id(session_service):
   await session_service.append_event(source_session, event)
 
   # Clone with custom ID
-  source_session = await session_service.get_session(
-      app_name=app_name, user_id=user_id, session_id=source_session.id
-  )
   cloned_session = await session_service.clone_session(
-      session=source_session, dst_session_id=custom_session_id
+      app_name=app_name,
+      src_user_id=user_id,
+      src_session_id=source_session.id,
+      new_session_id=custom_session_id,
   )
 
   # Verify
@@ -716,7 +717,10 @@ async def test_clone_session_with_existing_id_raises_error(session_service):
   # Attempt to clone to existing session ID
   with pytest.raises(AlreadyExistsError):
     await session_service.clone_session(
-        session=source_session, dst_session_id='existing_target'
+        app_name=app_name,
+        src_user_id=user_id,
+        src_session_id=source_session.id,
+        new_session_id='existing_target',
     )
 
 
@@ -742,10 +746,11 @@ async def test_clone_session_preserves_event_content(session_service):
   await session_service.append_event(source_session, event)
 
   # Clone the session
-  source_session = await session_service.get_session(
-      app_name=app_name, user_id=user_id, session_id=source_session.id
+  cloned_session = await session_service.clone_session(
+      app_name=app_name,
+      src_user_id=user_id,
+      src_session_id=source_session.id,
   )
-  cloned_session = await session_service.clone_session(session=source_session)
 
   # Verify event content is preserved
   assert len(cloned_session.events) == 1
@@ -776,7 +781,11 @@ async def test_clone_session_does_not_affect_source(session_service):
   original_event_count = len(original_source.events)
 
   # Clone the session
-  cloned_session = await session_service.clone_session(session=original_source)
+  cloned_session = await session_service.clone_session(
+      app_name=app_name,
+      src_user_id=user_id,
+      src_session_id='source_session',
+  )
 
   # Add event to cloned session
   new_event = Event(invocation_id='inv2', author='model')
@@ -787,3 +796,81 @@ async def test_clone_session_does_not_affect_source(session_service):
       app_name=app_name, user_id=user_id, session_id='source_session'
   )
   assert len(source_after_clone.events) == original_event_count
+
+
+@pytest.mark.asyncio
+async def test_clone_all_user_sessions(session_service):
+  """Test clone_session without src_session_id merges all user sessions."""
+  app_name = 'my_app'
+  source_user_id = 'user1'
+  dest_user_id = 'user2'
+
+  # Create multiple source sessions for user1
+  session1 = await session_service.create_session(
+      app_name=app_name,
+      user_id=source_user_id,
+      session_id='session1',
+      state={'key1': 'value1'},
+  )
+  session2 = await session_service.create_session(
+      app_name=app_name,
+      user_id=source_user_id,
+      session_id='session2',
+      state={'key2': 'value2'},
+  )
+
+  # Add events to each session
+  event1 = Event(invocation_id='inv1', author='user')
+  event2 = Event(invocation_id='inv2', author='model')
+  event3 = Event(invocation_id='inv3', author='user')
+  await session_service.append_event(session1, event1)
+  await session_service.append_event(session1, event2)
+  await session_service.append_event(session2, event3)
+
+  # Clone ALL sessions for user1 to user2 (no src_session_id)
+  cloned_session = await session_service.clone_session(
+      app_name=app_name,
+      src_user_id=source_user_id,
+      new_user_id=dest_user_id,
+      new_session_id='merged_session',
+  )
+
+  # Verify merged session
+  assert cloned_session is not None
+  assert cloned_session.user_id == dest_user_id
+  assert cloned_session.id == 'merged_session'
+  # Should have all 3 events from both source sessions
+  assert len(cloned_session.events) == 3
+  # State should be merged from both sessions
+  assert 'key1' in cloned_session.state
+  assert 'key2' in cloned_session.state
+
+
+@pytest.mark.asyncio
+async def test_clone_session_no_source_raises_error(session_service):
+  """Test that clone_session raises error if source session not found."""
+  app_name = 'my_app'
+  user_id = 'user'
+
+  # Try to clone non-existent session
+  with pytest.raises(ValueError, match='not found'):
+    await session_service.clone_session(
+        app_name=app_name,
+        src_user_id=user_id,
+        src_session_id='non_existent_session',
+    )
+
+
+@pytest.mark.asyncio
+async def test_clone_all_sessions_no_sessions_raises_error(session_service):
+  """Test clone_session raises error when user has no sessions."""
+  app_name = 'my_app'
+  user_id = 'user_with_no_sessions'
+
+  # Try to clone all sessions for user with no sessions
+  with pytest.raises(ValueError, match='No sessions found'):
+    await session_service.clone_session(
+        app_name=app_name,
+        src_user_id=user_id,
+        # No src_session_id means clone all sessions
+    )

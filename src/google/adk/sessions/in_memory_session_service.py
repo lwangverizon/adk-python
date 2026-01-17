@@ -290,38 +290,88 @@ class InMemorySessionService(BaseSessionService):
   async def clone_session(
       self,
       *,
-      session: Session,
-      dst_user_id: Optional[str] = None,
-      dst_session_id: Optional[str] = None,
+      app_name: str,
+      src_user_id: str,
+      src_session_id: Optional[str] = None,
+      new_user_id: Optional[str] = None,
+      new_session_id: Optional[str] = None,
   ) -> Session:
     return self._clone_session_impl(
-        session=session,
-        dst_user_id=dst_user_id,
-        dst_session_id=dst_session_id,
+        app_name=app_name,
+        src_user_id=src_user_id,
+        src_session_id=src_session_id,
+        new_user_id=new_user_id,
+        new_session_id=new_session_id,
     )
 
   def _clone_session_impl(
       self,
       *,
-      session: Session,
-      dst_user_id: Optional[str] = None,
-      dst_session_id: Optional[str] = None,
+      app_name: str,
+      src_user_id: str,
+      src_session_id: Optional[str] = None,
+      new_user_id: Optional[str] = None,
+      new_session_id: Optional[str] = None,
   ) -> Session:
     # Use source values as defaults
-    dst_user_id = dst_user_id or session.user_id
+    new_user_id = new_user_id or src_user_id
 
-    # Create the new session with copied state
+    # Collect source sessions and their events
+    source_sessions = []
+    if src_session_id:
+      # Single session clone
+      session = self._get_session_impl(
+          app_name=app_name,
+          user_id=src_user_id,
+          session_id=src_session_id,
+      )
+      if not session:
+        raise ValueError(
+            f'Source session {src_session_id} not found for user'
+            f' {src_user_id}.'
+        )
+      source_sessions.append(session)
+    else:
+      # All sessions clone - get all sessions for the user
+      list_response = self._list_sessions_impl(
+          app_name=app_name, user_id=src_user_id
+      )
+      if not list_response.sessions:
+        raise ValueError(f'No sessions found for user {src_user_id}.')
+      # Fetch each session with events
+      for sess in list_response.sessions:
+        full_session = self._get_session_impl(
+            app_name=app_name,
+            user_id=src_user_id,
+            session_id=sess.id,
+        )
+        if full_session:
+          source_sessions.append(full_session)
+
+    # Merge states from all source sessions
+    merged_state = {}
+    for session in source_sessions:
+      merged_state.update(copy.deepcopy(session.state))
+
+    # Create the new session (new_session_id=None triggers UUID4 generation)
     new_session = self._create_session_impl(
-        app_name=session.app_name,
-        user_id=dst_user_id,
-        state=copy.deepcopy(session.state),
-        session_id=dst_session_id,
+        app_name=app_name,
+        user_id=new_user_id,
+        state=merged_state,
+        session_id=new_session_id,
     )
 
-    # Get the storage session and copy events
-    storage_session = self.sessions[session.app_name][dst_user_id][new_session.id]
-    storage_session.events = copy.deepcopy(session.events)
-    storage_session.last_update_time = session.last_update_time
+    # Get the storage session and copy all events from all source sessions
+    storage_session = self.sessions[app_name][new_user_id][new_session.id]
+    all_events = []
+    latest_update_time = 0.0
+    for session in source_sessions:
+      all_events.extend(copy.deepcopy(session.events))
+      if session.last_update_time > latest_update_time:
+        latest_update_time = session.last_update_time
+
+    storage_session.events = all_events
+    storage_session.last_update_time = latest_update_time
 
     # Return a copy with merged state
     return self._get_session_impl(

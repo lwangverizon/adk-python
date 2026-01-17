@@ -106,28 +106,39 @@ class BaseSessionService(abc.ABC):
   async def clone_session(
       self,
       *,
-      session: Session,
-      dst_user_id: Optional[str] = None,
-      dst_session_id: Optional[str] = None,
+      app_name: str,
+      src_user_id: str,
+      src_session_id: Optional[str] = None,
+      new_user_id: Optional[str] = None,
+      new_session_id: Optional[str] = None,
   ) -> Session:
-    """Clones a session and its events to a new session.
+    """Clones session(s) and their events to a new session.
 
-    Creates a new session with the same events as the source session.
-    The destination session will have a new ID unless specified.
+    This method supports two modes:
+
+    1. Single session clone: When `src_session_id` is provided, clones that
+       specific session to the new session.
+
+    2. All sessions clone: When `src_session_id` is NOT provided, finds all
+       sessions for `src_user_id` and merges ALL their events into a single
+       new session.
 
     Args:
-      session: The source session to clone. Must include events to be copied.
-      dst_user_id: The user ID for the destination session. If not provided,
-        uses the same user_id as the source session.
-      dst_session_id: The session ID for the destination session. If not
-        provided, a new ID will be generated.
+      app_name: The name of the app.
+      src_user_id: The source user ID whose session(s) to clone.
+      src_session_id: The source session ID to clone. If not provided, all
+        sessions for the source user will be merged into one new session.
+      new_user_id: The user ID for the new session. If not provided, uses the
+        same user_id as the source.
+      new_session_id: The session ID for the new session. If not provided, a
+        new ID will be auto-generated (UUID4).
 
     Returns:
       The newly created session with cloned events.
 
     Raises:
-      ValueError: If the source session does not exist.
-      AlreadyExistsError: If a session with dst_session_id already exists.
+      ValueError: If no source sessions are found.
+      AlreadyExistsError: If a session with new_session_id already exists.
     """
 
   async def append_event(self, session: Session, event: Event) -> Event:
