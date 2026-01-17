@@ -379,12 +379,10 @@ class InMemorySessionService(BaseSessionService):
     storage_session.events = all_events
     storage_session.last_update_time = latest_update_time
 
-    # Return a copy with merged state
-    return self._get_session_impl(
-        app_name=new_session.app_name,
-        user_id=new_session.user_id,
-        session_id=new_session.id,
-    )
+    # Return the new session with events (avoid redundant lookup)
+    new_session.events = all_events
+    new_session.last_update_time = latest_update_time
+    return new_session
 
   @override
   async def append_event(self, session: Session, event: Event) -> Event:

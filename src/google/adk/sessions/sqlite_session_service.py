@@ -445,12 +445,9 @@ class SqliteSessionService(BaseSessionService):
         )
       await db.commit()
 
-    # Return the new session with events
-    return await self.get_session(
-        app_name=new_session.app_name,
-        user_id=new_session.user_id,
-        session_id=new_session.id,
-    )
+    # Return the new session with events (avoid redundant DB query)
+    new_session.events = all_events
+    return new_session
 
   @override
   async def append_event(self, session: Session, event: Event) -> Event:
