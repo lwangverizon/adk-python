@@ -102,6 +102,34 @@ class BaseSessionService(abc.ABC):
   ) -> None:
     """Deletes a session."""
 
+  @abc.abstractmethod
+  async def clone_session(
+      self,
+      *,
+      session: Session,
+      dst_user_id: Optional[str] = None,
+      dst_session_id: Optional[str] = None,
+  ) -> Session:
+    """Clones a session and its events to a new session.
+
+    Creates a new session with the same events as the source session.
+    The destination session will have a new ID unless specified.
+
+    Args:
+      session: The source session to clone. Must include events to be copied.
+      dst_user_id: The user ID for the destination session. If not provided,
+        uses the same user_id as the source session.
+      dst_session_id: The session ID for the destination session. If not
+        provided, a new ID will be generated.
+
+    Returns:
+      The newly created session with cloned events.
+
+    Raises:
+      ValueError: If the source session does not exist.
+      AlreadyExistsError: If a session with dst_session_id already exists.
+    """
+
   async def append_event(self, session: Session, event: Event) -> Event:
     """Appends an event to a session object."""
     if event.partial:

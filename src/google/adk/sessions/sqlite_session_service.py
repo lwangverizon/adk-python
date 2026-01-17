@@ -357,6 +357,55 @@ class SqliteSessionService(BaseSessionService):
       await db.commit()
 
   @override
+  async def clone_session(
+      self,
+      *,
+      session: Session,
+      dst_user_id: Optional[str] = None,
+      dst_session_id: Optional[str] = None,
+  ) -> Session:
+    # Use source values as defaults
+    dst_user_id = dst_user_id or session.user_id
+
+    # Create the new session (without state to avoid side effects on app/user
+    # state)
+    new_session = await self.create_session(
+        app_name=session.app_name,
+        user_id=dst_user_id,
+        state=copy.deepcopy(session.state),
+        session_id=dst_session_id,
+    )
+
+    # Copy all events from source to destination
+    async with self._get_db_connection() as db:
+      for event in session.events:
+        # Create a deep copy of the event
+        cloned_event = copy.deepcopy(event)
+        await db.execute(
+            """
+            INSERT INTO events (id, app_name, user_id, session_id, invocation_id, timestamp, event_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                cloned_event.id,
+                new_session.app_name,
+                new_session.user_id,
+                new_session.id,
+                cloned_event.invocation_id,
+                cloned_event.timestamp,
+                cloned_event.model_dump_json(exclude_none=True),
+            ),
+        )
+      await db.commit()
+
+    # Return the new session with events
+    return await self.get_session(
+        app_name=new_session.app_name,
+        user_id=new_session.user_id,
+        session_id=new_session.id,
+    )
+
+  @override
   async def append_event(self, session: Session, event: Event) -> Event:
     if event.partial:
       return event

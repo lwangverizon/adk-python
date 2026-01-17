@@ -245,6 +245,41 @@ class VertexAiSessionService(BaseSessionService):
         raise
 
   @override
+  async def clone_session(
+      self,
+      *,
+      session: Session,
+      dst_user_id: Optional[str] = None,
+      dst_session_id: Optional[str] = None,
+  ) -> Session:
+    if dst_session_id:
+      raise ValueError(
+          'User-provided Session id is not supported for'
+          ' VertexAISessionService.'
+      )
+
+    # Use source values as defaults
+    dst_user_id = dst_user_id or session.user_id
+
+    # Create the new session with copied state
+    new_session = await self.create_session(
+        app_name=session.app_name,
+        user_id=dst_user_id,
+        state=session.state,
+    )
+
+    # Copy all events from source to destination
+    for event in session.events:
+      await self.append_event(new_session, event)
+
+    # Return the new session with events
+    return await self.get_session(
+        app_name=new_session.app_name,
+        user_id=new_session.user_id,
+        session_id=new_session.id,
+    )
+
+  @override
   async def append_event(self, session: Session, event: Event) -> Event:
     # Update the in-memory session.
     await super().append_event(session=session, event=event)

@@ -287,6 +287,50 @@ class InMemorySessionService(BaseSessionService):
     self.sessions[app_name][user_id].pop(session_id)
 
   @override
+  async def clone_session(
+      self,
+      *,
+      session: Session,
+      dst_user_id: Optional[str] = None,
+      dst_session_id: Optional[str] = None,
+  ) -> Session:
+    return self._clone_session_impl(
+        session=session,
+        dst_user_id=dst_user_id,
+        dst_session_id=dst_session_id,
+    )
+
+  def _clone_session_impl(
+      self,
+      *,
+      session: Session,
+      dst_user_id: Optional[str] = None,
+      dst_session_id: Optional[str] = None,
+  ) -> Session:
+    # Use source values as defaults
+    dst_user_id = dst_user_id or session.user_id
+
+    # Create the new session with copied state
+    new_session = self._create_session_impl(
+        app_name=session.app_name,
+        user_id=dst_user_id,
+        state=copy.deepcopy(session.state),
+        session_id=dst_session_id,
+    )
+
+    # Get the storage session and copy events
+    storage_session = self.sessions[session.app_name][dst_user_id][new_session.id]
+    storage_session.events = copy.deepcopy(session.events)
+    storage_session.last_update_time = session.last_update_time
+
+    # Return a copy with merged state
+    return self._get_session_impl(
+        app_name=new_session.app_name,
+        user_id=new_session.user_id,
+        session_id=new_session.id,
+    )
+
+  @override
   async def append_event(self, session: Session, event: Event) -> Event:
     if event.partial:
       return event

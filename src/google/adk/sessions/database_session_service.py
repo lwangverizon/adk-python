@@ -416,6 +416,48 @@ class DatabaseSessionService(BaseSessionService):
       await sql_session.commit()
 
   @override
+  async def clone_session(
+      self,
+      *,
+      session: Session,
+      dst_user_id: Optional[str] = None,
+      dst_session_id: Optional[str] = None,
+  ) -> Session:
+    await self._prepare_tables()
+
+    # Use source values as defaults
+    dst_user_id = dst_user_id or session.user_id
+
+    # Create the new session (without state to avoid side effects on app/user
+    # state)
+    new_session = await self.create_session(
+        app_name=session.app_name,
+        user_id=dst_user_id,
+        state=copy.deepcopy(session.state),
+        session_id=dst_session_id,
+    )
+
+    # Copy all events from source to destination
+    schema = self._get_schema_classes()
+    async with self.database_session_factory() as sql_session:
+      for event in session.events:
+        # Create a deep copy of the event and assign new IDs
+        cloned_event = copy.deepcopy(event)
+        new_storage_event = schema.StorageEvent.from_event(
+            new_session, cloned_event
+        )
+        sql_session.add(new_storage_event)
+
+      await sql_session.commit()
+
+    # Return the new session with events
+    return await self.get_session(
+        app_name=new_session.app_name,
+        user_id=new_session.user_id,
+        session_id=new_session.id,
+    )
+
+  @override
   async def append_event(self, session: Session, event: Event) -> Event:
     await self._prepare_tables()
     if event.partial:

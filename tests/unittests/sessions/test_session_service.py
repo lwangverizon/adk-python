@@ -603,3 +603,187 @@ async def test_partial_events_are_not_persisted(session_service):
       app_name=app_name, user_id=user_id, session_id=session.id
   )
   assert len(session_got.events) == 0
+
+
+@pytest.mark.asyncio
+async def test_clone_session_basic(session_service):
+  """Test basic clone_session functionality."""
+  app_name = 'my_app'
+  user_id = 'user'
+
+  # Create source session with events
+  source_session = await session_service.create_session(
+      app_name=app_name, user_id=user_id, state={'key': 'value'}
+  )
+  event1 = Event(invocation_id='inv1', author='user')
+  event2 = Event(invocation_id='inv2', author='model')
+  await session_service.append_event(source_session, event1)
+  await session_service.append_event(source_session, event2)
+
+  # Clone the session
+  source_session = await session_service.get_session(
+      app_name=app_name, user_id=user_id, session_id=source_session.id
+  )
+  cloned_session = await session_service.clone_session(session=source_session)
+
+  # Verify the cloned session
+  assert cloned_session is not None
+  assert cloned_session.id != source_session.id
+  assert cloned_session.app_name == source_session.app_name
+  assert cloned_session.user_id == source_session.user_id
+  assert cloned_session.state == source_session.state
+  assert len(cloned_session.events) == 2
+  assert cloned_session.events[0].invocation_id == event1.invocation_id
+  assert cloned_session.events[1].invocation_id == event2.invocation_id
+
+
+@pytest.mark.asyncio
+async def test_clone_session_with_different_user_id(session_service):
+  """Test clone_session with a different destination user_id."""
+  app_name = 'my_app'
+  source_user_id = 'user1'
+  dest_user_id = 'user2'
+
+  # Create source session
+  source_session = await session_service.create_session(
+      app_name=app_name, user_id=source_user_id, state={'key': 'value'}
+  )
+  event = Event(invocation_id='inv1', author='user')
+  await session_service.append_event(source_session, event)
+
+  # Clone to different user
+  source_session = await session_service.get_session(
+      app_name=app_name, user_id=source_user_id, session_id=source_session.id
+  )
+  cloned_session = await session_service.clone_session(
+      session=source_session, dst_user_id=dest_user_id
+  )
+
+  # Verify
+  assert cloned_session.user_id == dest_user_id
+  assert cloned_session.app_name == source_session.app_name
+  assert len(cloned_session.events) == 1
+
+  # Verify the cloned session is persisted correctly
+  fetched_session = await session_service.get_session(
+      app_name=app_name, user_id=dest_user_id, session_id=cloned_session.id
+  )
+  assert fetched_session is not None
+  assert fetched_session.user_id == dest_user_id
+
+
+@pytest.mark.asyncio
+async def test_clone_session_with_custom_session_id(session_service):
+  """Test clone_session with a custom destination session_id."""
+  app_name = 'my_app'
+  user_id = 'user'
+  custom_session_id = 'custom_cloned_session'
+
+  # Create source session
+  source_session = await session_service.create_session(
+      app_name=app_name, user_id=user_id
+  )
+  event = Event(invocation_id='inv1', author='user')
+  await session_service.append_event(source_session, event)
+
+  # Clone with custom ID
+  source_session = await session_service.get_session(
+      app_name=app_name, user_id=user_id, session_id=source_session.id
+  )
+  cloned_session = await session_service.clone_session(
+      session=source_session, dst_session_id=custom_session_id
+  )
+
+  # Verify
+  assert cloned_session.id == custom_session_id
+  assert len(cloned_session.events) == 1
+
+
+@pytest.mark.asyncio
+async def test_clone_session_with_existing_id_raises_error(session_service):
+  """Test that clone_session raises error if destination session_id exists."""
+  app_name = 'my_app'
+  user_id = 'user'
+
+  # Create source and target sessions
+  source_session = await session_service.create_session(
+      app_name=app_name, user_id=user_id, session_id='source'
+  )
+  await session_service.create_session(
+      app_name=app_name, user_id=user_id, session_id='existing_target'
+  )
+
+  # Attempt to clone to existing session ID
+  with pytest.raises(AlreadyExistsError):
+    await session_service.clone_session(
+        session=source_session, dst_session_id='existing_target'
+    )
+
+
+@pytest.mark.asyncio
+async def test_clone_session_preserves_event_content(session_service):
+  """Test that clone_session preserves full event content."""
+  app_name = 'my_app'
+  user_id = 'user'
+
+  # Create source session with detailed event
+  source_session = await session_service.create_session(
+      app_name=app_name, user_id=user_id
+  )
+  event = Event(
+      invocation_id='invocation',
+      author='user',
+      content=types.Content(role='user', parts=[types.Part(text='test_text')]),
+      actions=EventActions(
+          artifact_delta={'file': 0},
+          transfer_to_agent='agent',
+      ),
+  )
+  await session_service.append_event(source_session, event)
+
+  # Clone the session
+  source_session = await session_service.get_session(
+      app_name=app_name, user_id=user_id, session_id=source_session.id
+  )
+  cloned_session = await session_service.clone_session(session=source_session)
+
+  # Verify event content is preserved
+  assert len(cloned_session.events) == 1
+  cloned_event = cloned_session.events[0]
+  assert cloned_event.invocation_id == event.invocation_id
+  assert cloned_event.author == event.author
+  assert cloned_event.content == event.content
+  assert cloned_event.actions.artifact_delta == event.actions.artifact_delta
+  assert cloned_event.actions.transfer_to_agent == event.actions.transfer_to_agent
+
+
+@pytest.mark.asyncio
+async def test_clone_session_does_not_affect_source(session_service):
+  """Test that cloning does not modify the source session."""
+  app_name = 'my_app'
+  user_id = 'user'
+
+  # Create source session
+  source_session = await session_service.create_session(
+      app_name=app_name, user_id=user_id, session_id='source_session'
+  )
+  event = Event(invocation_id='inv1', author='user')
+  await session_service.append_event(source_session, event)
+
+  original_source = await session_service.get_session(
+      app_name=app_name, user_id=user_id, session_id='source_session'
+  )
+  original_event_count = len(original_source.events)
+
+  # Clone the session
+  cloned_session = await session_service.clone_session(session=original_source)
+
+  # Add event to cloned session
+  new_event = Event(invocation_id='inv2', author='model')
+  await session_service.append_event(cloned_session, new_event)
+
+  # Verify source is unchanged
+  source_after_clone = await session_service.get_session(
+      app_name=app_name, user_id=user_id, session_id='source_session'
+  )
+  assert len(source_after_clone.events) == original_event_count
