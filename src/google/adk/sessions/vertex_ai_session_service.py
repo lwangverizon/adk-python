@@ -308,10 +308,19 @@ class VertexAiSessionService(BaseSessionService):
         state=merged_state,
     )
 
-    # Copy all events from all source sessions to the new session
+    # Collect all events, deduplicating by event ID (first occurrence wins)
+    all_events = []
+    seen_event_ids = set()
     for session in source_sessions:
       for event in session.events:
-        await self.append_event(new_session, event)
+        if event.id in seen_event_ids:
+          continue
+        seen_event_ids.add(event.id)
+        all_events.append(event)
+
+    # Copy events to the new session
+    for event in all_events:
+      await self.append_event(new_session, event)
 
     # Return the new session with events
     return await self.get_session(

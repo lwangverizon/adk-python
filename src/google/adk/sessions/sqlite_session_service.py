@@ -414,26 +414,35 @@ class SqliteSessionService(BaseSessionService):
         session_id=new_session_id,
     )
 
-    # Copy all events from all source sessions to the new session
+    # Collect all events, deduplicating by event ID (first occurrence wins)
+    all_events = []
+    seen_event_ids = set()
+    for session in source_sessions:
+      for event in session.events:
+        if event.id in seen_event_ids:
+          continue
+        seen_event_ids.add(event.id)
+        all_events.append(event)
+
+    # Copy events to the new session
     async with self._get_db_connection() as db:
-      for session in source_sessions:
-        for event in session.events:
-          cloned_event = copy.deepcopy(event)
-          await db.execute(
-              """
-              INSERT INTO events (id, app_name, user_id, session_id, invocation_id, timestamp, event_data)
-              VALUES (?, ?, ?, ?, ?, ?, ?)
-              """,
-              (
-                  cloned_event.id,
-                  new_session.app_name,
-                  new_session.user_id,
-                  new_session.id,
-                  cloned_event.invocation_id,
-                  cloned_event.timestamp,
-                  cloned_event.model_dump_json(exclude_none=True),
-              ),
-          )
+      for event in all_events:
+        cloned_event = copy.deepcopy(event)
+        await db.execute(
+            """
+            INSERT INTO events (id, app_name, user_id, session_id, invocation_id, timestamp, event_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                cloned_event.id,
+                new_session.app_name,
+                new_session.user_id,
+                new_session.id,
+                cloned_event.invocation_id,
+                cloned_event.timestamp,
+                cloned_event.model_dump_json(exclude_none=True),
+            ),
+        )
       await db.commit()
 
     # Return the new session with events

@@ -361,15 +361,21 @@ class InMemorySessionService(BaseSessionService):
         session_id=new_session_id,
     )
 
-    # Get the storage session and copy all events from all source sessions
-    storage_session = self.sessions[app_name][new_user_id][new_session.id]
+    # Collect all events, deduplicating by event ID (first occurrence wins)
     all_events = []
+    seen_event_ids = set()
     latest_update_time = 0.0
     for session in source_sessions:
-      all_events.extend(copy.deepcopy(session.events))
+      for event in session.events:
+        if event.id in seen_event_ids:
+          continue
+        seen_event_ids.add(event.id)
+        all_events.append(copy.deepcopy(event))
       if session.last_update_time > latest_update_time:
         latest_update_time = session.last_update_time
 
+    # Get the storage session and set events
+    storage_session = self.sessions[app_name][new_user_id][new_session.id]
     storage_session.events = all_events
     storage_session.last_update_time = latest_update_time
 

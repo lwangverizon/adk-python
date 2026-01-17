@@ -874,3 +874,43 @@ async def test_clone_all_sessions_no_sessions_raises_error(session_service):
         src_user_id=user_id,
         # No src_session_id means clone all sessions
     )
+
+
+@pytest.mark.asyncio
+async def test_clone_session_deduplicates_events(session_service):
+  """Test clone_session automatically deduplicates events by ID."""
+  app_name = 'my_app'
+  user_id = 'user'
+
+  # Create two sessions with some events having the same ID
+  session1 = await session_service.create_session(
+      app_name=app_name, user_id=user_id, session_id='session1'
+  )
+  session2 = await session_service.create_session(
+      app_name=app_name, user_id=user_id, session_id='session2'
+  )
+
+  # Create events - event1 and event3 have the same ID (duplicate)
+  event1 = Event(id='shared_event_id', invocation_id='inv1', author='user')
+  event2 = Event(id='unique_event_1', invocation_id='inv2', author='model')
+  event3 = Event(id='shared_event_id', invocation_id='inv3', author='user')
+  event4 = Event(id='unique_event_2', invocation_id='inv4', author='model')
+
+  await session_service.append_event(session1, event1)
+  await session_service.append_event(session1, event2)
+  await session_service.append_event(session2, event3)
+  await session_service.append_event(session2, event4)
+
+  # Clone - should have 3 events (duplicate automatically removed)
+  cloned_session = await session_service.clone_session(
+      app_name=app_name,
+      src_user_id=user_id,
+  )
+  assert len(cloned_session.events) == 3
+  # Verify the unique event IDs
+  event_ids = [e.id for e in cloned_session.events]
+  assert 'shared_event_id' in event_ids
+  assert 'unique_event_1' in event_ids
+  assert 'unique_event_2' in event_ids
+  # Count occurrences - shared_event_id should appear only once
+  assert event_ids.count('shared_event_id') == 1

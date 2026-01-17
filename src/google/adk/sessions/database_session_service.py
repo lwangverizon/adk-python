@@ -475,16 +475,25 @@ class DatabaseSessionService(BaseSessionService):
         session_id=new_session_id,
     )
 
-    # Copy all events from all source sessions to the new session
+    # Collect all events, deduplicating by event ID (first occurrence wins)
+    all_events = []
+    seen_event_ids = set()
+    for session in source_sessions:
+      for event in session.events:
+        if event.id in seen_event_ids:
+          continue
+        seen_event_ids.add(event.id)
+        all_events.append(event)
+
+    # Copy events to the new session
     schema = self._get_schema_classes()
     async with self.database_session_factory() as sql_session:
-      for session in source_sessions:
-        for event in session.events:
-          cloned_event = copy.deepcopy(event)
-          new_storage_event = schema.StorageEvent.from_event(
-              new_session, cloned_event
-          )
-          sql_session.add(new_storage_event)
+      for event in all_events:
+        cloned_event = copy.deepcopy(event)
+        new_storage_event = schema.StorageEvent.from_event(
+            new_session, cloned_event
+        )
+        sql_session.add(new_storage_event)
 
       await sql_session.commit()
 

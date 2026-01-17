@@ -123,6 +123,9 @@ class BaseSessionService(abc.ABC):
        sessions for `src_user_id` and merges ALL their events into a single
        new session.
 
+    Events are automatically deduplicated by event ID - only the first
+    occurrence of each event ID is kept.
+
     Args:
       app_name: The name of the app.
       src_user_id: The source user ID whose session(s) to clone.
