@@ -185,10 +185,9 @@ class BaseSessionService(abc.ABC):
     all_events: list[Event] = []
     seen_event_ids: set[str] = set()
     for event in all_source_events:
-      if event.id in seen_event_ids:
-        continue
-      seen_event_ids.add(event.id)
-      all_events.append(event)
+      if event.id not in seen_event_ids:
+        seen_event_ids.add(event.id)
+        all_events.append(event)
 
     return merged_state, all_events
 
