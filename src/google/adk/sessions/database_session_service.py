@@ -473,10 +473,9 @@ class DatabaseSessionService(BaseSessionService):
       # Step 3: Map events back to sessions
       events_by_session_id = {}
       for storage_event in all_storage_events:
-        sid = storage_event.session_id
-        if sid not in events_by_session_id:
-          events_by_session_id[sid] = []
-        events_by_session_id[sid].append(storage_event.to_event())
+        events_by_session_id.setdefault(storage_event.session_id, []).append(
+            storage_event.to_event()
+        )
 
       # Build full session objects with events
       for sess in list_response.sessions:
