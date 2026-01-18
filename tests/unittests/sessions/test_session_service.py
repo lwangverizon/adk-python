@@ -759,7 +759,9 @@ async def test_clone_session_preserves_event_content(session_service):
   assert cloned_event.author == event.author
   assert cloned_event.content == event.content
   assert cloned_event.actions.artifact_delta == event.actions.artifact_delta
-  assert cloned_event.actions.transfer_to_agent == event.actions.transfer_to_agent
+  assert (
+      cloned_event.actions.transfer_to_agent == event.actions.transfer_to_agent
+  )
 
 
 @pytest.mark.asyncio

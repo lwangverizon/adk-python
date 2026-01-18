@@ -276,8 +276,7 @@ class VertexAiSessionService(BaseSessionService):
       )
       if not session:
         raise ValueError(
-            f'Source session {src_session_id} not found for user'
-            f' {src_user_id}.'
+            f'Source session {src_session_id} not found for user {src_user_id}.'
         )
       source_sessions.append(session)
     else:

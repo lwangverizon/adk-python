@@ -327,8 +327,7 @@ class InMemorySessionService(BaseSessionService):
       )
       if not session:
         raise ValueError(
-            f'Source session {src_session_id} not found for user'
-            f' {src_user_id}.'
+            f'Source session {src_session_id} not found for user {src_user_id}.'
         )
       source_sessions.append(session)
     else:
@@ -348,7 +347,9 @@ class InMemorySessionService(BaseSessionService):
         # Deep copy the session to avoid mutations
         copied_session = copy.deepcopy(storage_session)
         # Merge state with app and user state
-        copied_session = self._merge_state(app_name, src_user_id, copied_session)
+        copied_session = self._merge_state(
+            app_name, src_user_id, copied_session
+        )
         source_sessions.append(copied_session)
 
     # Use shared helper for state merging and event deduplication
@@ -368,7 +369,9 @@ class InMemorySessionService(BaseSessionService):
 
     # Get latest update time explicitly (don't rely on sorting side effects)
     latest_update_time = (
-        max(s.last_update_time for s in source_sessions) if source_sessions else 0.0
+        max(s.last_update_time for s in source_sessions)
+        if source_sessions
+        else 0.0
     )
 
     # Get the storage session and set events

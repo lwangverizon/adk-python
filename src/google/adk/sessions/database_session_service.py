@@ -443,8 +443,7 @@ class DatabaseSessionService(BaseSessionService):
       )
       if not session:
         raise ValueError(
-            f"Source session {src_session_id} not found for user"
-            f" {src_user_id}."
+            f"Source session {src_session_id} not found for user {src_user_id}."
         )
       source_sessions.append(session)
     else:
@@ -529,8 +528,8 @@ class DatabaseSessionService(BaseSessionService):
       if storage_session.update_timestamp_tz > session.last_update_time:
         raise ValueError(
             "The last_update_time provided in the session object"
-            f" {datetime.fromtimestamp(session.last_update_time):'%Y-%m-%d %H:%M:%S'} is"
-            " earlier than the update_time in the storage_session"
+            f" {datetime.fromtimestamp(session.last_update_time):'%Y-%m-%d %H:%M:%S'}"
+            " is earlier than the update_time in the storage_session"
             f" {datetime.fromtimestamp(storage_session.update_timestamp_tz):'%Y-%m-%d %H:%M:%S'}."
             " Please check if it is a stale session."
         )

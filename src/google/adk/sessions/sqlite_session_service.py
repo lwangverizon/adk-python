@@ -380,8 +380,7 @@ class SqliteSessionService(BaseSessionService):
       )
       if not session:
         raise ValueError(
-            f"Source session {src_session_id} not found for user"
-            f" {src_user_id}."
+            f"Source session {src_session_id} not found for user {src_user_id}."
         )
       source_sessions.append(session)
     else:
@@ -409,8 +408,8 @@ class SqliteSessionService(BaseSessionService):
       # Step 3: Map events back to sessions
       events_by_session_id = {}
       for row in event_rows:
-        events_by_session_id.setdefault(row['session_id'], []).append(
-            Event.model_validate_json(row['event_data'])
+        events_by_session_id.setdefault(row["session_id"], []).append(
+            Event.model_validate_json(row["event_data"])
         )
 
       # Build full session objects with events
