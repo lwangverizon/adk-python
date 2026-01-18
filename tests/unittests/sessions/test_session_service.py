@@ -606,98 +606,64 @@ async def test_partial_events_are_not_persisted(session_service):
 
 
 @pytest.mark.asyncio
-async def test_clone_session_basic(session_service):
-  """Test basic clone_session functionality with specific session_id."""
+@pytest.mark.parametrize(
+    'new_user_id,new_session_id',
+    [
+        (None, None),  # Basic clone - same user, auto-generated session ID
+        ('user2', None),  # Different user, auto-generated session ID
+        (None, 'custom_session'),  # Same user, custom session ID
+        ('user2', 'custom_session'),  # Different user and custom session ID
+    ],
+    ids=['basic', 'different_user', 'custom_session_id', 'both_custom'],
+)
+async def test_clone_session_single_session(
+    session_service, new_user_id, new_session_id
+):
+  """Test clone_session with various parameter combinations."""
   app_name = 'my_app'
-  user_id = 'user'
+  source_user_id = 'user'
 
   # Create source session with events
   source_session = await session_service.create_session(
-      app_name=app_name, user_id=user_id, state={'key': 'value'}
+      app_name=app_name, user_id=source_user_id, state={'key': 'value'}
   )
   event1 = Event(invocation_id='inv1', author='user')
   event2 = Event(invocation_id='inv2', author='model')
   await session_service.append_event(source_session, event1)
   await session_service.append_event(source_session, event2)
 
-  # Clone the session using source identifiers
+  # Clone the session
   cloned_session = await session_service.clone_session(
       app_name=app_name,
-      src_user_id=user_id,
+      src_user_id=source_user_id,
       src_session_id=source_session.id,
+      new_user_id=new_user_id,
+      new_session_id=new_session_id,
   )
+
+  # Determine expected values
+  expected_user_id = new_user_id if new_user_id else source_user_id
 
   # Verify the cloned session
   assert cloned_session is not None
   assert cloned_session.id != source_session.id
   assert cloned_session.app_name == app_name
-  assert cloned_session.user_id == user_id
+  assert cloned_session.user_id == expected_user_id
   assert cloned_session.state == {'key': 'value'}
   assert len(cloned_session.events) == 2
   assert cloned_session.events[0].invocation_id == event1.invocation_id
   assert cloned_session.events[1].invocation_id == event2.invocation_id
 
-
-@pytest.mark.asyncio
-async def test_clone_session_with_different_user_id(session_service):
-  """Test clone_session with a different destination user_id."""
-  app_name = 'my_app'
-  source_user_id = 'user1'
-  dest_user_id = 'user2'
-
-  # Create source session
-  source_session = await session_service.create_session(
-      app_name=app_name, user_id=source_user_id, state={'key': 'value'}
-  )
-  event = Event(invocation_id='inv1', author='user')
-  await session_service.append_event(source_session, event)
-
-  # Clone to different user
-  cloned_session = await session_service.clone_session(
-      app_name=app_name,
-      src_user_id=source_user_id,
-      src_session_id=source_session.id,
-      new_user_id=dest_user_id,
-  )
-
-  # Verify
-  assert cloned_session.user_id == dest_user_id
-  assert cloned_session.app_name == app_name
-  assert len(cloned_session.events) == 1
+  # Verify custom session ID if provided
+  if new_session_id:
+    assert cloned_session.id == new_session_id
 
   # Verify the cloned session is persisted correctly
   fetched_session = await session_service.get_session(
-      app_name=app_name, user_id=dest_user_id, session_id=cloned_session.id
+      app_name=app_name, user_id=expected_user_id, session_id=cloned_session.id
   )
   assert fetched_session is not None
-  assert fetched_session.user_id == dest_user_id
-
-
-@pytest.mark.asyncio
-async def test_clone_session_with_custom_session_id(session_service):
-  """Test clone_session with a custom destination session_id."""
-  app_name = 'my_app'
-  user_id = 'user'
-  custom_session_id = 'custom_cloned_session'
-
-  # Create source session
-  source_session = await session_service.create_session(
-      app_name=app_name, user_id=user_id
-  )
-  event = Event(invocation_id='inv1', author='user')
-  await session_service.append_event(source_session, event)
-
-  # Clone with custom ID
-  cloned_session = await session_service.clone_session(
-      app_name=app_name,
-      src_user_id=user_id,
-      src_session_id=source_session.id,
-      new_session_id=custom_session_id,
-  )
-
-  # Verify
-  assert cloned_session.id == custom_session_id
-  assert len(cloned_session.events) == 1
+  assert fetched_session.user_id == expected_user_id
 
 
 @pytest.mark.asyncio
@@ -849,32 +815,26 @@ async def test_clone_all_user_sessions(session_service):
 
 
 @pytest.mark.asyncio
-async def test_clone_session_no_source_raises_error(session_service):
-  """Test that clone_session raises error if source session not found."""
-  app_name = 'my_app'
-  user_id = 'user'
-
-  # Try to clone non-existent session
-  with pytest.raises(ValueError, match='not found'):
-    await session_service.clone_session(
-        app_name=app_name,
-        src_user_id=user_id,
-        src_session_id='non_existent_session',
-    )
-
-
-@pytest.mark.asyncio
-async def test_clone_all_sessions_no_sessions_raises_error(session_service):
-  """Test clone_session raises error when user has no sessions."""
+@pytest.mark.parametrize(
+    'src_session_id,error_match',
+    [
+        ('non_existent_session', 'not found'),  # Specific session not found
+        (None, 'No sessions found'),  # User has no sessions (clone all mode)
+    ],
+    ids=['session_not_found', 'no_sessions_for_user'],
+)
+async def test_clone_session_source_not_found_raises_error(
+    session_service, src_session_id, error_match
+):
+  """Test clone_session raises ValueError when source cannot be found."""
   app_name = 'my_app'
   user_id = 'user_with_no_sessions'
 
-  # Try to clone all sessions for user with no sessions
-  with pytest.raises(ValueError, match='No sessions found'):
+  with pytest.raises(ValueError, match=error_match):
     await session_service.clone_session(
         app_name=app_name,
         src_user_id=user_id,
-        # No src_session_id means clone all sessions
+        src_session_id=src_session_id,
     )
 
 
