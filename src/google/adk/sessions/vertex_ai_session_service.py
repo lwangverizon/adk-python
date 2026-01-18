@@ -300,6 +300,11 @@ class VertexAiSessionService(BaseSessionService):
       ]
       fetched_sessions = await asyncio.gather(*fetch_tasks)
       source_sessions = [s for s in fetched_sessions if s is not None]
+      if not source_sessions and list_response.sessions:
+        raise ValueError(
+            f'Could not retrieve any source sessions for user {src_user_id}. '
+            'They may have been deleted after being listed.'
+        )
 
     # Use shared helper for state merging and event deduplication
     merged_state, all_events = self._prepare_sessions_for_cloning(
