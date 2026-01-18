@@ -409,11 +409,8 @@ class SqliteSessionService(BaseSessionService):
       # Step 3: Map events back to sessions
       events_by_session_id = {}
       for row in event_rows:
-        sid = row["session_id"]
-        if sid not in events_by_session_id:
-          events_by_session_id[sid] = []
-        events_by_session_id[sid].append(
-            Event.model_validate_json(row["event_data"])
+        events_by_session_id.setdefault(row['session_id'], []).append(
+            Event.model_validate_json(row['event_data'])
         )
 
       # Build full session objects with events
