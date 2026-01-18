@@ -372,7 +372,7 @@ class SqliteSessionService(BaseSessionService):
     # Collect source sessions and their events
     source_sessions = []
     if src_session_id:
-      # Single session clone
+      # Single session clone - use get_session (no N+1 issue)
       session = await self.get_session(
           app_name=app_name,
           user_id=src_user_id,
@@ -385,21 +385,41 @@ class SqliteSessionService(BaseSessionService):
         )
       source_sessions.append(session)
     else:
-      # All sessions clone - get all sessions for the user
+      # All sessions clone - optimized to avoid N+1 query problem
+      # Step 1: Get all sessions with state (no events)
       list_response = await self.list_sessions(
           app_name=app_name, user_id=src_user_id
       )
       if not list_response.sessions:
         raise ValueError(f"No sessions found for user {src_user_id}.")
-      # Fetch each session with events
-      for sess in list_response.sessions:
-        full_session = await self.get_session(
-            app_name=app_name,
-            user_id=src_user_id,
-            session_id=sess.id,
+
+      session_ids = [sess.id for sess in list_response.sessions]
+
+      # Step 2: Fetch ALL events for all session IDs in a single query
+      async with self._get_db_connection() as db:
+        placeholders = ",".join("?" * len(session_ids))
+        query = f"""
+            SELECT session_id, event_data FROM events
+            WHERE app_name=? AND user_id=? AND session_id IN ({placeholders})
+            ORDER BY timestamp ASC
+        """
+        params = [app_name, src_user_id] + session_ids
+        event_rows = await db.execute_fetchall(query, params)
+
+      # Step 3: Map events back to sessions
+      events_by_session_id = {}
+      for row in event_rows:
+        sid = row["session_id"]
+        if sid not in events_by_session_id:
+          events_by_session_id[sid] = []
+        events_by_session_id[sid].append(
+            Event.model_validate_json(row["event_data"])
         )
-        if full_session:
-          source_sessions.append(full_session)
+
+      # Build full session objects with events
+      for sess in list_response.sessions:
+        sess.events = events_by_session_id.get(sess.id, [])
+        source_sessions.append(sess)
 
     # Merge states from all source sessions
     merged_state = {}

@@ -287,15 +287,19 @@ class VertexAiSessionService(BaseSessionService):
       )
       if not list_response.sessions:
         raise ValueError(f'No sessions found for user {src_user_id}.')
-      # Fetch each session with events
-      for sess in list_response.sessions:
-        full_session = await self.get_session(
-            app_name=app_name,
-            user_id=src_user_id,
-            session_id=sess.id,
-        )
-        if full_session:
-          source_sessions.append(full_session)
+
+      # Fetch all sessions with events in parallel using asyncio.gather
+      # (Vertex AI API doesn't support batch retrieval, so we parallelize)
+      fetch_tasks = [
+          self.get_session(
+              app_name=app_name,
+              user_id=src_user_id,
+              session_id=sess.id,
+          )
+          for sess in list_response.sessions
+      ]
+      fetched_sessions = await asyncio.gather(*fetch_tasks)
+      source_sessions = [s for s in fetched_sessions if s is not None]
 
     # Merge states from all source sessions (deep copy to avoid mutations)
     merged_state = {}

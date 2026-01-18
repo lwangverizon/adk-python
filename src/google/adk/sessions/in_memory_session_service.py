@@ -332,21 +332,24 @@ class InMemorySessionService(BaseSessionService):
         )
       source_sessions.append(session)
     else:
-      # All sessions clone - get all sessions for the user
-      list_response = self._list_sessions_impl(
-          app_name=app_name, user_id=src_user_id
-      )
-      if not list_response.sessions:
+      # All sessions clone - optimized direct access to avoid N+1 lookups
+      if (
+          app_name not in self.sessions
+          or src_user_id not in self.sessions[app_name]
+      ):
         raise ValueError(f'No sessions found for user {src_user_id}.')
-      # Fetch each session with events
-      for sess in list_response.sessions:
-        full_session = self._get_session_impl(
-            app_name=app_name,
-            user_id=src_user_id,
-            session_id=sess.id,
-        )
-        if full_session:
-          source_sessions.append(full_session)
+
+      user_sessions = self.sessions[app_name][src_user_id]
+      if not user_sessions:
+        raise ValueError(f'No sessions found for user {src_user_id}.')
+
+      # Directly access storage sessions and build full session objects
+      for session_id, storage_session in user_sessions.items():
+        # Deep copy the session to avoid mutations
+        copied_session = copy.deepcopy(storage_session)
+        # Merge state with app and user state
+        copied_session = self._merge_state(app_name, src_user_id, copied_session)
+        source_sessions.append(copied_session)
 
     # Merge states from all source sessions
     merged_state = {}
