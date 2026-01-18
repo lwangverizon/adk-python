@@ -483,13 +483,10 @@ class DatabaseSessionService(BaseSessionService):
         sess.events = events_by_session_id.get(sess.id, [])
         source_sessions.append(sess)
 
-    # Sort sessions by update time for deterministic state merging
-    source_sessions.sort(key=lambda s: s.last_update_time)
-
-    # Merge states from all source sessions
-    merged_state = {}
-    for session in source_sessions:
-      merged_state.update(copy.deepcopy(session.state))
+    # Use shared helper for state merging and event deduplication
+    merged_state, all_events = self._prepare_sessions_for_cloning(
+        source_sessions
+    )
 
     # Create the new session (new_session_id=None triggers UUID4 generation)
     new_session = await self.create_session(
@@ -498,21 +495,6 @@ class DatabaseSessionService(BaseSessionService):
         state=merged_state,
         session_id=new_session_id,
     )
-
-    # Collect all events, sort by timestamp, then deduplicate
-    # to ensure chronological "first occurrence wins"
-    all_source_events = []
-    for session in source_sessions:
-      all_source_events.extend(session.events)
-    all_source_events.sort(key=lambda e: e.timestamp)
-
-    all_events = []
-    seen_event_ids = set()
-    for event in all_source_events:
-      if event.id in seen_event_ids:
-        continue
-      seen_event_ids.add(event.id)
-      all_events.append(event)
 
     # Copy events to the new session using bulk insert
     async with self.database_session_factory() as sql_session:

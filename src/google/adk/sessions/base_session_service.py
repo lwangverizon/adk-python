@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import abc
+import copy
 from typing import Any
 from typing import Optional
 
@@ -143,6 +144,52 @@ class BaseSessionService(abc.ABC):
       ValueError: If no source sessions are found.
       AlreadyExistsError: If a session with new_session_id already exists.
     """
+
+  def _prepare_sessions_for_cloning(
+      self, source_sessions: list[Session]
+  ) -> tuple[dict[str, Any], list[Event]]:
+    """Prepares source sessions for cloning by merging states and deduplicating events.
+
+    This is a shared helper method used by all clone_session implementations
+    to ensure consistent behavior across different session service backends.
+
+    The method:
+    1. Sorts sessions by last_update_time for deterministic state merging
+    2. Merges states from all sessions (later sessions overwrite earlier ones)
+    3. Collects all events, sorts by timestamp, and deduplicates by event ID
+
+    Args:
+      source_sessions: List of source sessions to process.
+
+    Returns:
+      A tuple of (merged_state, deduplicated_events):
+        - merged_state: Combined state from all sessions (deep copied)
+        - deduplicated_events: Chronologically sorted, deduplicated events
+    """
+    # Sort sessions by update time for deterministic state merging
+    source_sessions.sort(key=lambda s: s.last_update_time)
+
+    # Merge states from all source sessions
+    merged_state: dict[str, Any] = {}
+    for session in source_sessions:
+      merged_state.update(copy.deepcopy(session.state))
+
+    # Collect all events, sort by timestamp, then deduplicate
+    # to ensure chronological "first occurrence wins"
+    all_source_events: list[Event] = []
+    for session in source_sessions:
+      all_source_events.extend(session.events)
+    all_source_events.sort(key=lambda e: e.timestamp)
+
+    all_events: list[Event] = []
+    seen_event_ids: set[str] = set()
+    for event in all_source_events:
+      if event.id in seen_event_ids:
+        continue
+      seen_event_ids.add(event.id)
+      all_events.append(event)
+
+    return merged_state, all_events
 
   async def append_event(self, session: Session, event: Event) -> Event:
     """Appends an event to a session object."""
