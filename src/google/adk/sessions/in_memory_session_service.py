@@ -366,9 +366,9 @@ class InMemorySessionService(BaseSessionService):
         session_id=new_session_id,
     )
 
-    # Get latest update time from sorted sessions
+    # Get latest update time explicitly (don't rely on sorting side effects)
     latest_update_time = (
-        source_sessions[-1].last_update_time if source_sessions else 0.0
+        max(s.last_update_time for s in source_sessions) if source_sessions else 0.0
     )
 
     # Get the storage session and set events

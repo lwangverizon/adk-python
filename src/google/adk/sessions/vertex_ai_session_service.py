@@ -314,6 +314,9 @@ class VertexAiSessionService(BaseSessionService):
     )
 
     # Copy events to the new session (deep copy to avoid mutations)
+    # Note: Each event requires a separate API call to Vertex AI. For sessions
+    # with many events, this may be slow. Vertex AI does not currently support
+    # batch event appending.
     for event in all_events:
       await self.append_event(new_session, copy.deepcopy(event))
 

@@ -167,17 +167,18 @@ class BaseSessionService(abc.ABC):
         - deduplicated_events: Chronologically sorted, deduplicated events
     """
     # Sort sessions by update time for deterministic state merging
-    source_sessions.sort(key=lambda s: s.last_update_time)
+    # Use sorted() to avoid modifying the input list in-place
+    sorted_sessions = sorted(source_sessions, key=lambda s: s.last_update_time)
 
     # Merge states from all source sessions
     merged_state: dict[str, Any] = {}
-    for session in source_sessions:
+    for session in sorted_sessions:
       merged_state.update(copy.deepcopy(session.state))
 
     # Collect all events, sort by timestamp, then deduplicate
     # to ensure chronological "first occurrence wins"
     all_source_events: list[Event] = []
-    for session in source_sessions:
+    for session in sorted_sessions:
       all_source_events.extend(session.events)
     all_source_events.sort(key=lambda e: e.timestamp)
 
