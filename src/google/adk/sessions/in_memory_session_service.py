@@ -351,6 +351,9 @@ class InMemorySessionService(BaseSessionService):
         copied_session = self._merge_state(app_name, src_user_id, copied_session)
         source_sessions.append(copied_session)
 
+    # Sort sessions by update time for deterministic state merging
+    source_sessions.sort(key=lambda s: s.last_update_time)
+
     # Merge states from all source sessions
     merged_state = {}
     for session in source_sessions:
@@ -364,18 +367,25 @@ class InMemorySessionService(BaseSessionService):
         session_id=new_session_id,
     )
 
-    # Collect all events, deduplicating by event ID (first occurrence wins)
+    # Collect all events, sort by timestamp, then deduplicate
+    # to ensure chronological "first occurrence wins"
+    all_source_events = []
+    for session in source_sessions:
+      all_source_events.extend(session.events)
+    all_source_events.sort(key=lambda e: e.timestamp)
+
     all_events = []
     seen_event_ids = set()
-    latest_update_time = 0.0
-    for session in source_sessions:
-      for event in session.events:
-        if event.id in seen_event_ids:
-          continue
-        seen_event_ids.add(event.id)
-        all_events.append(copy.deepcopy(event))
-      if session.last_update_time > latest_update_time:
-        latest_update_time = session.last_update_time
+    for event in all_source_events:
+      if event.id in seen_event_ids:
+        continue
+      seen_event_ids.add(event.id)
+      all_events.append(copy.deepcopy(event))
+
+    # Get latest update time from sorted sessions
+    latest_update_time = (
+        source_sessions[-1].last_update_time if source_sessions else 0.0
+    )
 
     # Get the storage session and set events
     storage_session = self.sessions[app_name][new_user_id][new_session.id]

@@ -421,6 +421,9 @@ class SqliteSessionService(BaseSessionService):
         sess.events = events_by_session_id.get(sess.id, [])
         source_sessions.append(sess)
 
+    # Sort sessions by update time for deterministic state merging
+    source_sessions.sort(key=lambda s: s.last_update_time)
+
     # Merge states from all source sessions
     merged_state = {}
     for session in source_sessions:
@@ -434,35 +437,42 @@ class SqliteSessionService(BaseSessionService):
         session_id=new_session_id,
     )
 
-    # Collect all events, deduplicating by event ID (first occurrence wins)
+    # Collect all events, sort by timestamp, then deduplicate
+    # to ensure chronological "first occurrence wins"
+    all_source_events = []
+    for session in source_sessions:
+      all_source_events.extend(session.events)
+    all_source_events.sort(key=lambda e: e.timestamp)
+
     all_events = []
     seen_event_ids = set()
-    for session in source_sessions:
-      for event in session.events:
-        if event.id in seen_event_ids:
-          continue
-        seen_event_ids.add(event.id)
-        all_events.append(event)
+    for event in all_source_events:
+      if event.id in seen_event_ids:
+        continue
+      seen_event_ids.add(event.id)
+      all_events.append(event)
 
-    # Copy events to the new session
+    # Copy events to the new session using bulk insert
     async with self._get_db_connection() as db:
+      event_params = []
       for event in all_events:
         cloned_event = copy.deepcopy(event)
-        await db.execute(
-            """
-            INSERT INTO events (id, app_name, user_id, session_id, invocation_id, timestamp, event_data)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                cloned_event.id,
-                new_session.app_name,
-                new_session.user_id,
-                new_session.id,
-                cloned_event.invocation_id,
-                cloned_event.timestamp,
-                cloned_event.model_dump_json(exclude_none=True),
-            ),
-        )
+        event_params.append((
+            cloned_event.id,
+            new_session.app_name,
+            new_session.user_id,
+            new_session.id,
+            cloned_event.invocation_id,
+            cloned_event.timestamp,
+            cloned_event.model_dump_json(exclude_none=True),
+        ))
+      await db.executemany(
+          """
+          INSERT INTO events (id, app_name, user_id, session_id, invocation_id, timestamp, event_data)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+          """,
+          event_params,
+      )
       await db.commit()
 
     # Return the new session with events (avoid redundant DB query)

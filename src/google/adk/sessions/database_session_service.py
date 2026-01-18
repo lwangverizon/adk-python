@@ -483,6 +483,9 @@ class DatabaseSessionService(BaseSessionService):
         sess.events = events_by_session_id.get(sess.id, [])
         source_sessions.append(sess)
 
+    # Sort sessions by update time for deterministic state merging
+    source_sessions.sort(key=lambda s: s.last_update_time)
+
     # Merge states from all source sessions
     merged_state = {}
     for session in source_sessions:
@@ -496,25 +499,28 @@ class DatabaseSessionService(BaseSessionService):
         session_id=new_session_id,
     )
 
-    # Collect all events, deduplicating by event ID (first occurrence wins)
+    # Collect all events, sort by timestamp, then deduplicate
+    # to ensure chronological "first occurrence wins"
+    all_source_events = []
+    for session in source_sessions:
+      all_source_events.extend(session.events)
+    all_source_events.sort(key=lambda e: e.timestamp)
+
     all_events = []
     seen_event_ids = set()
-    for session in source_sessions:
-      for event in session.events:
-        if event.id in seen_event_ids:
-          continue
-        seen_event_ids.add(event.id)
-        all_events.append(event)
+    for event in all_source_events:
+      if event.id in seen_event_ids:
+        continue
+      seen_event_ids.add(event.id)
+      all_events.append(event)
 
-    # Copy events to the new session
+    # Copy events to the new session using bulk insert
     async with self.database_session_factory() as sql_session:
-      for event in all_events:
-        cloned_event = copy.deepcopy(event)
-        new_storage_event = schema.StorageEvent.from_event(
-            new_session, cloned_event
-        )
-        sql_session.add(new_storage_event)
-
+      new_storage_events = [
+          schema.StorageEvent.from_event(new_session, copy.deepcopy(event))
+          for event in all_events
+      ]
+      sql_session.add_all(new_storage_events)
       await sql_session.commit()
 
     # Return the new session with events (avoid redundant DB query)
