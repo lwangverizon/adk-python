@@ -26,14 +26,15 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 
-from ..utils.feature_decorator import experimental
+from ..features import experimental
+from ..features import FeatureName
 from .common_configs import AgentRefConfig
 from .common_configs import CodeConfig
 
 TBaseAgentConfig = TypeVar('TBaseAgentConfig', bound='BaseAgentConfig')
 
 
-@experimental
+@experimental(FeatureName.AGENT_CONFIG)
 class BaseAgentConfig(BaseModel):
   """The config for the YAML schema of a BaseAgent.
 
@@ -53,6 +54,10 @@ class BaseAgentConfig(BaseModel):
   )
 
   name: str = Field(description='Required. The name of the agent.')
+
+  version: str = Field(
+      default='', description='Optional. The version of the agent.'
+  )
 
   description: str = Field(
       default='', description='Optional. The description of the agent.'

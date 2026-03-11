@@ -40,10 +40,11 @@ from typing_extensions import TypeAlias
 
 from ..events.event import Event
 from ..events.event_actions import EventActions
+from ..features import experimental
+from ..features import FeatureName
 from ..telemetry import tracing
 from ..telemetry.tracing import tracer
 from ..utils.context_utils import Aclosing
-from ..utils.feature_decorator import experimental
 from .base_agent_config import BaseAgentConfig
 from .callback_context import CallbackContext
 
@@ -70,7 +71,7 @@ AfterAgentCallback: TypeAlias = Union[
 SelfAgent = TypeVar('SelfAgent', bound='BaseAgent')
 
 
-@experimental
+@experimental(FeatureName.AGENT_STATE)
 class BaseAgentState(BaseModel):
   """Base class for all agent states."""
 
@@ -121,7 +122,9 @@ class BaseAgent(BaseModel):
   One-line description is enough and preferred.
   """
 
-  parent_agent: Optional[BaseAgent] = Field(default=None, init=False)
+  parent_agent: Optional[BaseAgent] = Field(
+      default=None, init=False, exclude=True
+  )
   """The parent agent of this agent.
 
   Note that an agent can ONLY be added as sub-agent once.
@@ -132,6 +135,12 @@ class BaseAgent(BaseModel):
   """
   sub_agents: list[BaseAgent] = Field(default_factory=list)
   """The sub-agents of this agent."""
+
+  version: str = ''
+  """The agent's version.
+
+  Version of the agent being invoked. Used to identify the Agent involved in telemetry.
+  """
 
   before_agent_callback: Optional[BeforeAgentCallback] = None
   """Callback or list of callbacks to be invoked before the agent run.
@@ -618,7 +627,7 @@ class BaseAgent(BaseModel):
 
   @final
   @classmethod
-  @experimental
+  @experimental(FeatureName.AGENT_CONFIG)
   def from_config(
       cls: Type[SelfAgent],
       config: BaseAgentConfig,
@@ -642,7 +651,7 @@ class BaseAgent(BaseModel):
     return cls(**kwargs)
 
   @classmethod
-  @experimental
+  @experimental(FeatureName.AGENT_CONFIG)
   def _parse_config(
       cls: Type[SelfAgent],
       config: BaseAgentConfig,
@@ -677,6 +686,7 @@ class BaseAgent(BaseModel):
 
     kwargs: Dict[str, Any] = {
         'name': config.name,
+        'version': config.version,
         'description': config.description,
     }
     if config.sub_agents:
