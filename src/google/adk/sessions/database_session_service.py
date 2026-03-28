@@ -617,6 +617,98 @@ class DatabaseSessionService(BaseSessionService):
       await sql_session.commit()
 
   @override
+  async def clone_session(
+      self,
+      *,
+      app_name: str,
+      src_user_id: str,
+      src_session_id: Optional[str] = None,
+      new_user_id: Optional[str] = None,
+      new_session_id: Optional[str] = None,
+  ) -> Session:
+    await self._prepare_tables()
+
+    # Use source values as defaults
+    new_user_id = new_user_id or src_user_id
+
+    schema = self._get_schema_classes()
+
+    # Collect source sessions and their events
+    source_sessions = []
+    if src_session_id:
+      # Single session clone - use get_session (no N+1 issue)
+      session = await self.get_session(
+          app_name=app_name,
+          user_id=src_user_id,
+          session_id=src_session_id,
+      )
+      if not session:
+        raise ValueError(
+            f'Source session {src_session_id} not found for user {src_user_id}.'
+        )
+      source_sessions.append(session)
+    else:
+      # All sessions clone - optimized to avoid N+1 query problem
+      # Step 1: Get all sessions with state (no events)
+      list_response = await self.list_sessions(
+          app_name=app_name, user_id=src_user_id
+      )
+      if not list_response.sessions:
+        raise ValueError(f'No sessions found for user {src_user_id}.')
+
+      session_ids = [sess.id for sess in list_response.sessions]
+
+      # Step 2: Fetch ALL events for all session IDs in a single query
+      async with self.database_session_factory() as sql_session:
+        stmt = (
+            select(schema.StorageEvent)
+            .filter(schema.StorageEvent.app_name == app_name)
+            .filter(schema.StorageEvent.user_id == src_user_id)
+            .filter(schema.StorageEvent.session_id.in_(session_ids))
+            .order_by(schema.StorageEvent.timestamp.asc())
+        )
+        result = await sql_session.execute(stmt)
+        all_storage_events = result.scalars().all()
+
+      # Step 3: Map events back to sessions
+      events_by_session_id = {}
+      for storage_event in all_storage_events:
+        events_by_session_id.setdefault(storage_event.session_id, []).append(
+            storage_event.to_event()
+        )
+
+      # Build full session objects with events
+      for sess in list_response.sessions:
+        sess.events = events_by_session_id.get(sess.id, [])
+        source_sessions.append(sess)
+
+    # Use shared helper for state merging and event deduplication
+    merged_state, all_events = self._prepare_sessions_for_cloning(
+        source_sessions
+    )
+
+    # Create the new session (new_session_id=None triggers UUID4 generation)
+    new_session = await self.create_session(
+        app_name=app_name,
+        user_id=new_user_id,
+        state=merged_state,
+        session_id=new_session_id,
+    )
+
+    # Copy events to the new session using bulk insert
+    async with self.database_session_factory() as sql_session:
+      new_storage_events = [
+          schema.StorageEvent.from_event(new_session, copy.deepcopy(event))
+          for event in all_events
+      ]
+      sql_session.add_all(new_storage_events)
+      await sql_session.commit()
+
+    # Return the new session with events (avoid redundant DB query)
+    new_session.events = all_events
+    return new_session
+
+  @override
   async def append_event(self, session: Session, event: Event) -> Event:
     await self._prepare_tables()
     if event.partial:

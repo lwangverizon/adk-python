@@ -287,6 +287,104 @@ class InMemorySessionService(BaseSessionService):
     self.sessions[app_name][user_id].pop(session_id)
 
   @override
+  async def clone_session(
+      self,
+      *,
+      app_name: str,
+      src_user_id: str,
+      src_session_id: Optional[str] = None,
+      new_user_id: Optional[str] = None,
+      new_session_id: Optional[str] = None,
+  ) -> Session:
+    return self._clone_session_impl(
+        app_name=app_name,
+        src_user_id=src_user_id,
+        src_session_id=src_session_id,
+        new_user_id=new_user_id,
+        new_session_id=new_session_id,
+    )
+
+  def _clone_session_impl(
+      self,
+      *,
+      app_name: str,
+      src_user_id: str,
+      src_session_id: Optional[str] = None,
+      new_user_id: Optional[str] = None,
+      new_session_id: Optional[str] = None,
+  ) -> Session:
+    # Use source values as defaults
+    new_user_id = new_user_id or src_user_id
+
+    # Collect source sessions and their events
+    source_sessions = []
+    if src_session_id:
+      # Single session clone
+      session = self._get_session_impl(
+          app_name=app_name,
+          user_id=src_user_id,
+          session_id=src_session_id,
+      )
+      if not session:
+        raise ValueError(
+            f'Source session {src_session_id} not found for user {src_user_id}.'
+        )
+      source_sessions.append(session)
+    else:
+      # All sessions clone - optimized direct access to avoid N+1 lookups
+      if (
+          app_name not in self.sessions
+          or src_user_id not in self.sessions[app_name]
+      ):
+        raise ValueError(f'No sessions found for user {src_user_id}.')
+
+      user_sessions = self.sessions[app_name][src_user_id]
+      if not user_sessions:
+        raise ValueError(f'No sessions found for user {src_user_id}.')
+
+      # Directly access storage sessions and build full session objects
+      for session_id, storage_session in user_sessions.items():
+        # Deep copy the session to avoid mutations
+        copied_session = copy.deepcopy(storage_session)
+        # Merge state with app and user state
+        copied_session = self._merge_state(
+            app_name, src_user_id, copied_session
+        )
+        source_sessions.append(copied_session)
+
+    # Use shared helper for state merging and event deduplication
+    merged_state, all_events = self._prepare_sessions_for_cloning(
+        source_sessions
+    )
+    # Deep copy events for in-memory storage isolation
+    all_events = [copy.deepcopy(event) for event in all_events]
+
+    # Create the new session (new_session_id=None triggers UUID4 generation)
+    new_session = self._create_session_impl(
+        app_name=app_name,
+        user_id=new_user_id,
+        state=merged_state,
+        session_id=new_session_id,
+    )
+
+    # Get latest update time explicitly (don't rely on sorting side effects)
+    latest_update_time = (
+        max(s.last_update_time for s in source_sessions)
+        if source_sessions
+        else 0.0
+    )
+
+    # Get the storage session and set events
+    storage_session = self.sessions[app_name][new_user_id][new_session.id]
+    storage_session.events = all_events
+    storage_session.last_update_time = latest_update_time
+
+    # Return the new session with events (avoid redundant lookup)
+    new_session.events = all_events
+    new_session.last_update_time = latest_update_time
+    return new_session
+
+  @override
   async def append_event(self, session: Session, event: Event) -> Event:
     if event.partial:
       return event

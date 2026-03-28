@@ -357,6 +357,107 @@ class SqliteSessionService(BaseSessionService):
       await db.commit()
 
   @override
+  async def clone_session(
+      self,
+      *,
+      app_name: str,
+      src_user_id: str,
+      src_session_id: Optional[str] = None,
+      new_user_id: Optional[str] = None,
+      new_session_id: Optional[str] = None,
+  ) -> Session:
+    # Use source values as defaults
+    new_user_id = new_user_id or src_user_id
+
+    # Collect source sessions and their events
+    source_sessions = []
+    if src_session_id:
+      # Single session clone - use get_session (no N+1 issue)
+      session = await self.get_session(
+          app_name=app_name,
+          user_id=src_user_id,
+          session_id=src_session_id,
+      )
+      if not session:
+        raise ValueError(
+            f"Source session {src_session_id} not found for user {src_user_id}."
+        )
+      source_sessions.append(session)
+    else:
+      # All sessions clone - optimized to avoid N+1 query problem
+      # Step 1: Get all sessions with state (no events)
+      list_response = await self.list_sessions(
+          app_name=app_name, user_id=src_user_id
+      )
+      if not list_response.sessions:
+        raise ValueError(f"No sessions found for user {src_user_id}.")
+
+      session_ids = [sess.id for sess in list_response.sessions]
+
+      # Step 2: Fetch ALL events for all session IDs in a single query
+      async with self._get_db_connection() as db:
+        placeholders = ",".join("?" * len(session_ids))
+        query = f"""
+            SELECT session_id, event_data FROM events
+            WHERE app_name=? AND user_id=? AND session_id IN ({placeholders})
+            ORDER BY timestamp ASC
+        """
+        params = [app_name, src_user_id] + session_ids
+        event_rows = await db.execute_fetchall(query, params)
+
+      # Step 3: Map events back to sessions
+      events_by_session_id = {}
+      for row in event_rows:
+        events_by_session_id.setdefault(row["session_id"], []).append(
+            Event.model_validate_json(row["event_data"])
+        )
+
+      # Build full session objects with events
+      for sess in list_response.sessions:
+        sess.events = events_by_session_id.get(sess.id, [])
+        source_sessions.append(sess)
+
+    # Use shared helper for state merging and event deduplication
+    merged_state, all_events = self._prepare_sessions_for_cloning(
+        source_sessions
+    )
+
+    # Create the new session (new_session_id=None triggers UUID4 generation)
+    new_session = await self.create_session(
+        app_name=app_name,
+        user_id=new_user_id,
+        state=merged_state,
+        session_id=new_session_id,
+    )
+
+    # Copy events to the new session using bulk insert
+    async with self._get_db_connection() as db:
+      event_params = []
+      for event in all_events:
+        cloned_event = copy.deepcopy(event)
+        event_params.append((
+            cloned_event.id,
+            new_session.app_name,
+            new_session.user_id,
+            new_session.id,
+            cloned_event.invocation_id,
+            cloned_event.timestamp,
+            cloned_event.model_dump_json(exclude_none=True),
+        ))
+      await db.executemany(
+          """
+          INSERT INTO events (id, app_name, user_id, session_id, invocation_id, timestamp, event_data)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+          """,
+          event_params,
+      )
+      await db.commit()
+
+    # Return the new session with events (avoid redundant DB query)
+    new_session.events = all_events
+    return new_session
+
+  @override
   async def append_event(self, session: Session, event: Event) -> Event:
     if event.partial:
       return event
