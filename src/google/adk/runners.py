@@ -17,53 +17,51 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from pathlib import Path
 import queue
 import sys
 import threading
-from typing import Any
-from typing import AsyncGenerator
-from typing import Callable
-from typing import Generator
-from typing import List
-from typing import Optional
 import warnings
+from pathlib import Path
+from typing import (
+  TYPE_CHECKING,
+  Any,
+  AsyncGenerator,
+  Callable,
+  Generator,
+  List,
+  Optional,
+)
 
-from google.adk.apps.compaction import _run_compaction_for_sliding_window
 from google.genai import types
 
-from .agents.base_agent import BaseAgent
-from .agents.base_agent import BaseAgentState
-from .agents.context_cache_config import ContextCacheConfig
-from .agents.invocation_context import InvocationContext
-from .agents.invocation_context import new_invocation_context_id
-from .agents.live_request_queue import LiveRequestQueue
-from .agents.run_config import RunConfig
-from .apps.app import App
-from .apps.app import ResumabilityConfig
-from .artifacts.base_artifact_service import BaseArtifactService
-from .artifacts.in_memory_artifact_service import InMemoryArtifactService
-from .auth.credential_service.base_credential_service import BaseCredentialService
-from .code_executors.built_in_code_executor import BuiltInCodeExecutor
-from .errors.session_not_found_error import SessionNotFoundError
-from .events.event import Event
-from .events.event import EventActions
-from .flows.llm_flows import contents
-from .flows.llm_flows.functions import find_event_by_function_call_id
-from .flows.llm_flows.functions import find_matching_function_call
-from .memory.base_memory_service import BaseMemoryService
-from .memory.in_memory_memory_service import InMemoryMemoryService
-from .platform.thread import create_thread
-from .plugins.base_plugin import BasePlugin
-from .plugins.plugin_manager import PluginManager
-from .sessions.base_session_service import BaseSessionService
-from .sessions.base_session_service import GetSessionConfig
-from .sessions.in_memory_session_service import InMemorySessionService
-from .sessions.session import Session
-from .telemetry.tracing import tracer
-from .tools.base_toolset import BaseToolset
-from .utils._debug_output import print_event
-from .utils.context_utils import Aclosing
+from google.adk.agents.base_agent import BaseAgent, BaseAgentState
+from google.adk.agents.context_cache_config import ContextCacheConfig
+from google.adk.agents.invocation_context import InvocationContext, new_invocation_context_id
+from google.adk.agents.live_request_queue import LiveRequestQueue
+from google.adk.agents.run_config import RunConfig
+from google.adk.artifacts.base_artifact_service import BaseArtifactService
+from google.adk.auth.credential_service.base_credential_service import BaseCredentialService
+from google.adk.code_executors.built_in_code_executor import BuiltInCodeExecutor
+from google.adk.errors.session_not_found_error import SessionNotFoundError
+from google.adk.events.event import Event, EventActions
+from google.adk.flows.llm_flows import contents
+from google.adk.flows.llm_flows.functions import (
+  find_event_by_function_call_id,
+  find_matching_function_call,
+)
+from google.adk.memory.base_memory_service import BaseMemoryService
+from google.adk.platform.thread import create_thread
+from google.adk.plugins.base_plugin import BasePlugin
+from google.adk.plugins.plugin_manager import PluginManager
+from google.adk.sessions.base_session_service import BaseSessionService, GetSessionConfig
+from google.adk.sessions.session import Session
+from google.adk.telemetry.tracing import tracer
+from google.adk.tools.base_toolset import BaseToolset
+from google.adk.utils._debug_output import print_event
+from google.adk.utils.context_utils import Aclosing
+
+if TYPE_CHECKING:
+  from .apps.app import App, ResumabilityConfig
 
 logger = logging.getLogger('google_adk.' + __name__)
 
@@ -588,10 +586,7 @@ class Runner:
 
     If event compaction is enabled in the App configuration, it will be
     performed after all agent events for the current invocation have been
-    yielded. Compaction runs as a background task and does not block the
-    generator from completing, allowing the frontend to receive responses
-    without delay. However, this does not block new `run_async` calls for
-    subsequent user queries, which can be started concurrently.
+    yielded.
 
     Args:
       user_id: The user ID of the session.
@@ -684,7 +679,7 @@ class Runner:
         async with Aclosing(
             self._exec_with_plugin(
                 invocation_context=invocation_context,
-                session=session,
+                session=invocation_context.session,
                 execute_fn=execute,
                 is_live_call=False,
             )
@@ -699,35 +694,15 @@ class Runner:
         # limit concurrent compactions and prevent resource exhaustion under
         # high concurrency.
         if self.app and self.app.events_compaction_config:
-          logger.debug('Scheduling event compactor in background.')
+          logger.debug('Running event compactor.')
+          from google.adk.apps.compaction import _run_compaction_for_sliding_window
 
-          async def _run_compaction_with_error_handling():
-            try:
-              # Get or lazily create the semaphore within async context to avoid
-              # RuntimeError when Runner is created before event loop starts
-              semaphore = self._get_or_create_compaction_semaphore()
-              async with semaphore:
-                await _run_compaction_for_sliding_window(
-                    self.app,
-                    session,
-                    self.session_service,
-                    skip_token_compaction=(
-                        invocation_context.token_compaction_checked
-                    ),
-                )
-            except asyncio.CancelledError:
-              logger.debug('Event compaction cancelled.')
-              raise
-            except Exception as e:
-              logger.error(
-                  'Event compaction failed but not blocking response: %s',
-                  e,
-                  exc_info=True,
-              )
-
-          task = asyncio.create_task(_run_compaction_with_error_handling())
-          self._background_tasks.add(task)
-          task.add_done_callback(self._background_tasks.discard)
+          await _run_compaction_for_sliding_window(
+              self.app,
+              invocation_context.session,
+              self.session_service,
+              skip_token_compaction=invocation_context.token_compaction_checked,
+          )
 
     async with Aclosing(_run_with_trace(new_message, invocation_id)) as agen:
       async for event in agen:
@@ -888,17 +863,17 @@ class Runner:
 
   def _should_append_event(self, event: Event, is_live_call: bool) -> bool:
     """Checks if an event should be appended to the session."""
-    # Don't append audio response from model in live mode to session.
+    # Don't append media (audio/video/image) response from model in live mode to session.
     # The data is appended to artifacts with a reference in file_data in the
-    # event.
+    # event if save_live_blob is True.
     # We should append non-partial events only.For example, non-finished(partial)
     # transcription events should not be appended.
     # Function call and function response events should be appended.
     # Other control events should be appended.
-    if is_live_call and contents._is_live_model_audio_event_with_inline_data(
+    if is_live_call and contents._is_live_model_media_event_with_inline_data(
         event
     ):
-      # We don't append live model audio events with inline data to avoid
+      # We don't append live model media events with inline data to avoid
       # storing large blobs in the session. However, events with file_data
       # (references to artifacts) should be appended.
       return False
@@ -943,7 +918,7 @@ class Runner:
 
     Args:
       invocation_context: The invocation context
-      session: The current session
+      session: The current session (ignored, kept for backward compatibility)
       execute_fn: A callable that returns an AsyncGenerator of Events
       is_live_call: Whether this is a live call
 
@@ -968,7 +943,7 @@ class Runner:
       )
       if self._should_append_event(early_exit_event, is_live_call):
         await self.session_service.append_event(
-            session=session,
+            session=invocation_context.session,
             event=early_exit_event,
         )
       yield early_exit_event
@@ -1033,13 +1008,13 @@ class Runner:
                 )
                 if self._should_append_event(event, is_live_call):
                   await self.session_service.append_event(
-                      session=session, event=output_event
+                      session=invocation_context.session, event=output_event
                   )
 
                 for buffered_event in buffered_events:
                   logger.debug('Appending buffered event: %s', buffered_event)
                   await self.session_service.append_event(
-                      session=session, event=buffered_event
+                      session=invocation_context.session, event=buffered_event
                   )
                   yield buffered_event  # yield buffered events to caller
                 buffered_events = []
@@ -1049,12 +1024,12 @@ class Runner:
                 if self._should_append_event(event, is_live_call):
                   logger.debug('Appending non-buffered event: %s', event)
                   await self.session_service.append_event(
-                      session=session, event=output_event
+                      session=invocation_context.session, event=output_event
                   )
           else:
             if event.partial is not True:
               await self.session_service.append_event(
-                  session=session, event=output_event
+                  session=invocation_context.session, event=output_event
               )
 
           yield output_event
@@ -1106,8 +1081,8 @@ class Runner:
         file_name = f'artifact_{invocation_context.invocation_id}_{i}'
         await self.artifact_service.save_artifact(
             app_name=self.app_name,
-            user_id=session.user_id,
-            session_id=session.id,
+            user_id=invocation_context.session.user_id,
+            session_id=invocation_context.session.id,
             filename=file_name,
             artifact=part,
         )
@@ -1134,7 +1109,9 @@ class Runner:
     if function_call := invocation_context._find_matching_function_call(event):
       event.branch = function_call.branch
 
-    await self.session_service.append_event(session=session, event=event)
+    await self.session_service.append_event(
+        session=invocation_context.session, event=event
+    )
 
   async def run_live(
       self,
@@ -1229,7 +1206,9 @@ class Runner:
     )
 
     root_agent = self.agent
-    invocation_context.agent = self._find_agent_to_run(session, root_agent)
+    invocation_context.agent = self._find_agent_to_run(
+        invocation_context.session, root_agent
+    )
 
     async def execute(ctx: InvocationContext) -> AsyncGenerator[Event]:
       async with Aclosing(ctx.agent.run_live(ctx)) as agen:
@@ -1239,7 +1218,7 @@ class Runner:
     async with Aclosing(
         self._exec_with_plugin(
             invocation_context=invocation_context,
-            session=session,
+            session=invocation_context.session,
             execute_fn=execute,
             is_live_call=True,
         )
@@ -1457,14 +1436,16 @@ class Runner:
     # Step 2: Handle new message, by running callbacks and appending to
     # session.
     await self._handle_new_message(
-        session=session,
+        session=invocation_context.session,
         new_message=new_message,
         invocation_context=invocation_context,
         run_config=run_config,
         state_delta=state_delta,
     )
     # Step 3: Set agent to run for the invocation.
-    invocation_context.agent = self._find_agent_to_run(session, self.agent)
+    invocation_context.agent = self._find_agent_to_run(
+        invocation_context.session, self.agent
+    )
     return invocation_context
 
   async def _setup_context_for_resumed_invocation(
@@ -1513,7 +1494,7 @@ class Runner:
     # Step 3: Maybe handle new message.
     if new_message:
       await self._handle_new_message(
-          session=session,
+          session=invocation_context.session,
           new_message=user_message,
           invocation_context=invocation_context,
           run_config=run_config,
@@ -1527,7 +1508,9 @@ class Runner:
     # started from a sub-agent and paused on a sub-agent.
     # We should find the appropriate agent to run to continue the invocation.
     if self.agent.name not in invocation_context.end_of_agents:
-      invocation_context.agent = self._find_agent_to_run(session, self.agent)
+      invocation_context.agent = self._find_agent_to_run(
+          invocation_context.session, self.agent
+      )
     return invocation_context
 
   def _find_user_message_for_invocation(
@@ -1661,7 +1644,7 @@ class Runner:
       if 'save_input_blobs_as_artifacts' in run_config.model_fields_set:
         deprecated_save_blobs = run_config.save_input_blobs_as_artifacts
       await self._append_new_message_to_session(
-          session=session,
+          session=invocation_context.session,
           new_message=new_message,
           invocation_context=invocation_context,
           save_input_blobs_as_artifacts=deprecated_save_blobs,
@@ -1718,14 +1701,9 @@ class Runner:
     if self.plugin_manager:
       await self.plugin_manager.close()
 
-    # Wait for background compaction tasks to complete
-    if self._background_tasks:
-      logger.debug(
-          'Waiting for %d background compaction tasks to complete...',
-          len(self._background_tasks),
-      )
-      await asyncio.gather(*self._background_tasks, return_exceptions=True)
-      self._background_tasks.clear()
+    # Close Session Service
+    if self.session_service:
+      await self.session_service.flush()
 
     logger.info('Runner closed.')
 
@@ -1776,6 +1754,10 @@ class InMemoryRunner(Runner):
         app: Optional App instance.
         plugin_close_timeout: The timeout in seconds for plugin close methods.
     """
+    from .artifacts.in_memory_artifact_service import InMemoryArtifactService
+    from .memory.in_memory_memory_service import InMemoryMemoryService
+    from .sessions.in_memory_session_service import InMemorySessionService
+
     if app is None and app_name is None:
       app_name = 'InMemoryRunner'
     super().__init__(
