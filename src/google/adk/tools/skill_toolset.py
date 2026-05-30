@@ -930,6 +930,7 @@ class SkillToolset(BaseToolset):
       code_executor: BaseCodeExecutor | None = None,
       script_timeout: int = _DEFAULT_SCRIPT_TIMEOUT,
       additional_tools: list[ToolUnion] | None = None,
+      eager_skill_injection: bool = False,
       tool_name_prefix: str | None = None,
       tool_filter: ToolPredicate | list[str] | None = None,
   ):
@@ -944,6 +945,13 @@ class SkillToolset(BaseToolset):
         scripts executed via exec().
       additional_tools: Optional list of `BaseTool` or `BaseToolset` instances
         to be made available to the agent when certain skills are activated.
+      eager_skill_injection: If True, the catalog of available skills (names and
+        descriptions) is injected directly into the system instruction up
+        front, and the `list_skills` tool is omitted. If False (default), the
+        catalog is not injected and the agent discovers skills on demand by
+        calling the `list_skills` tool. Eager injection trades extra prompt
+        tokens on every request for one fewer tool round-trip; prefer it for
+        small, fixed skill sets and leave it off when the catalog is large.
       tool_name_prefix: Optional prefix to prepend to tool names.
       tool_filter: Optional filter to select specific tools.
     """
@@ -962,6 +970,7 @@ class SkillToolset(BaseToolset):
     self._registry = registry
     self._code_executor = code_executor
     self._script_timeout = script_timeout
+    self._eager_skill_injection = eager_skill_injection
     # Needed for mid-turn reloading of skill tools.
     self._use_invocation_cache = False
     # Cache fetched remote skill definitions per turn to reduce requests to registry
@@ -982,13 +991,16 @@ class SkillToolset(BaseToolset):
         ft = FunctionTool(tool_union)
         self._provided_tools_by_name[ft.name] = ft
 
-    # Initialize core skill tools
+    # Initialize core skill tools. When eager injection is enabled the skill
+    # catalog is placed directly in the system instruction (see
+    # process_llm_request), so the on-demand list_skills tool is omitted.
     self._tools = [
-        ListSkillsTool(self),
         LoadSkillTool(self),
         LoadSkillResourceTool(self),
         RunSkillScriptTool(self),
     ]
+    if not self._eager_skill_injection:
+      self._tools.insert(0, ListSkillsTool(self))
     if self._registry:
       self._tools.append(SearchSkillsTool(self))
 
@@ -1116,9 +1128,12 @@ class SkillToolset(BaseToolset):
         _build_skill_system_instruction(prefix=self.tool_name_prefix)
     ]
 
+    # Inject the skill catalog into the instruction when the agent has no
+    # list_skills tool to discover skills on demand: either eager injection was
+    # requested, or the tool is otherwise unavailable.
     has_list_skills = any(isinstance(t, ListSkillsTool) for t in self._tools)
 
-    if not has_list_skills:
+    if self._eager_skill_injection or not has_list_skills:
       skills = self._list_skills()
       skills_xml = prompt.format_skills_as_xml(skills)
       instructions.append(skills_xml)

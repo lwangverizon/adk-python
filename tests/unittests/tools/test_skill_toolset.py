@@ -466,6 +466,94 @@ async def test_process_llm_request_without_list_skills_tool(
   assert "skill2" in instructions[1]
 
 
+@pytest.mark.asyncio
+async def test_eager_skill_injection_omits_list_skills_tool(
+    mock_skill1, mock_skill2
+):
+  toolset = skill_toolset.SkillToolset(
+      [mock_skill1, mock_skill2], eager_skill_injection=True
+  )
+  tools = await toolset.get_tools()
+  tool_names = {t.name for t in tools}
+  assert "list_skills" not in tool_names
+  # The remaining core tools are still available.
+  assert "load_skill" in tool_names
+  assert "load_skill_resource" in tool_names
+  assert "run_skill_script" in tool_names
+
+
+@pytest.mark.asyncio
+async def test_eager_skill_injection_injects_catalog(
+    mock_skill1, mock_skill2, tool_context_instance
+):
+  toolset = skill_toolset.SkillToolset(
+      [mock_skill1, mock_skill2], eager_skill_injection=True
+  )
+  llm_req = mock.create_autospec(llm_request_model.LlmRequest, instance=True)
+
+  await toolset.process_llm_request(
+      tool_context=tool_context_instance, llm_request=llm_req
+  )
+
+  llm_req.append_instructions.assert_called_once()
+  args, _ = llm_req.append_instructions.call_args
+  instructions = args[0]
+  assert len(instructions) == 2
+  assert instructions[0] == skill_toolset.DEFAULT_SKILL_SYSTEM_INSTRUCTION
+  assert "<available_skills>" in instructions[1]
+  assert "skill1" in instructions[1]
+  assert "skill2" in instructions[1]
+
+
+@pytest.mark.asyncio
+async def test_eager_skill_injection_default_off_keeps_list_skills(
+    mock_skill1, mock_skill2, tool_context_instance
+):
+  # Default behavior: list_skills tool is present and the catalog is not
+  # injected into the instruction.
+  toolset = skill_toolset.SkillToolset([mock_skill1, mock_skill2])
+  tools = await toolset.get_tools()
+  assert "list_skills" in {t.name for t in tools}
+
+  llm_req = mock.create_autospec(llm_request_model.LlmRequest, instance=True)
+  await toolset.process_llm_request(
+      tool_context=tool_context_instance, llm_request=llm_req
+  )
+  llm_req.append_instructions.assert_called_once_with(
+      [skill_toolset.DEFAULT_SKILL_SYSTEM_INSTRUCTION]
+  )
+
+
+@pytest.mark.asyncio
+async def test_eager_skill_injection_with_registry(
+    mock_registry, mock_skill1, tool_context_instance
+):
+  toolset = skill_toolset.SkillToolset(
+      [mock_skill1], registry=mock_registry, eager_skill_injection=True
+  )
+
+  # search_skills is still available; list_skills is omitted.
+  tools = await toolset.get_tools()
+  tool_names = {t.name for t in tools}
+  assert "search_skills" in tool_names
+  assert "list_skills" not in tool_names
+
+  llm_req = mock.create_autospec(llm_request_model.LlmRequest, instance=True)
+  await toolset.process_llm_request(
+      tool_context=tool_context_instance, llm_request=llm_req
+  )
+
+  llm_req.append_instructions.assert_called_once()
+  args, _ = llm_req.append_instructions.call_args
+  instructions = args[0]
+  # System instruction + injected catalog + registry search hint.
+  assert len(instructions) == 3
+  assert instructions[0] == skill_toolset.DEFAULT_SKILL_SYSTEM_INSTRUCTION
+  assert "<available_skills>" in instructions[1]
+  assert "skill1" in instructions[1]
+  assert "search_skills" in instructions[2]
+
+
 def test_duplicate_skill_name_raises(mock_skill1):
   skill_dup = mock.create_autospec(models.Skill, instance=True)
   skill_dup.name = "skill1"
