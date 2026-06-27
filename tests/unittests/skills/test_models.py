@@ -234,21 +234,19 @@ def test_metadata_adk_additional_tools_invalid_type():
     })
 
 
-def test_metadata_adk_inject_session_state_bool():
+def test_metadata_adk_inject_state_bool():
   fm = models.Frontmatter.model_validate({
       "name": "my-skill",
       "description": "desc",
-      "metadata": {"adk_inject_session_state": True},
+      "metadata": {"adk_inject_state": True},
   })
-  assert fm.metadata["adk_inject_session_state"] is True
+  assert fm.metadata["adk_inject_state"] is True
 
 
-def test_metadata_adk_inject_session_state_invalid_type():
-  with pytest.raises(
-      ValidationError, match="adk_inject_session_state must be a boolean"
-  ):
+def test_metadata_adk_inject_state_rejected_as_string():
+  with pytest.raises(ValidationError, match="adk_inject_state must be a bool"):
     models.Frontmatter.model_validate({
         "name": "my-skill",
         "description": "desc",
-        "metadata": {"adk_inject_session_state": "yes"},
+        "metadata": {"adk_inject_state": "true"},
     })
