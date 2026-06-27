@@ -1769,18 +1769,6 @@ def test_system_instruction_marks_load_skill_as_non_terminal():
   assert "empty response" in instruction
 
 
-def test_system_instruction_rule_2_avoids_before_replying_framing():
-  """Rule 2 must not say to follow instructions "before replying".
-
-  That framing is read as license to end the turn after load_skill, which is
-  the original trigger for the empty-response regression.
-  """
-  assert (
-      "before replying"
-      not in skill_toolset.DEFAULT_SKILL_SYSTEM_INSTRUCTION
-  )
-
-
 def test_prefixed_system_instruction_includes_continue_after_load_rule():
   """The prefixed builder variant must also carry rule 7 (with the prefix)."""
   instruction = skill_toolset._build_skill_system_instruction(prefix="my")

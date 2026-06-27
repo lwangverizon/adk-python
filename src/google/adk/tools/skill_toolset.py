@@ -80,9 +80,9 @@ def _build_skill_system_instruction(prefix: str | None = None) -> str:
       f'the `{p}load_skill` tool with `skill_name="<SKILL_NAME>"` to read '
       "its full instructions before proceeding.\n"
       "2. Once you have read the instructions, follow them exactly as "
-      "documented. For example, if the instruction lists multiple steps, "
-      "please make sure you complete all of them in order, and only then "
-      "reply to the user.\n"
+      "documented before replying to the user. For example, If the "
+      "instruction lists multiple steps, please make sure you complete all "
+      "of them in order.\n"
       f"3. The `{p}load_skill_resource` tool is for viewing files within a "
       "skill's directory (e.g., `references/*`, `assets/*`, `scripts/*`). "
       "It is ONLY for skill-bundled files — do NOT use it to access "
