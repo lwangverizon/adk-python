@@ -1213,7 +1213,7 @@ def __build_response_event(
   #
   # Local import to avoid a circular import (agents -> flows -> tools -> agents);
   # AgentTool pulls in the agents package, so it cannot be imported at module top.
-  from ..tools.agent_tool import AgentTool
+  from ...tools.agent_tool import AgentTool
 
   has_displayable_result = display_result is not None and display_result != {
       'result': None
