@@ -50,14 +50,14 @@ class GeminiLlmConnection(BaseLlmConnection):
     self._output_transcription_text: str = ''
     self._api_backend = api_backend
     self._model_version = model_version
-    self._is_gemini_3_1_flash_live = model_name_utils.is_gemini_3_1_flash_live(
+    self._is_gemini_3_x_live = model_name_utils._is_gemini_3_x_live(
         model_version
     )
     self._is_gemini_3_5_live_translate = (
         model_name_utils.is_gemini_3_5_live_translate(model_version)
     )
 
-  async def send_history(self, history: list[types.Content]):
+  async def send_history(self, history: list[types.Content]) -> None:
     """Sends the conversation history to the gemini model.
 
     You call this method right after setting up the model connection.
@@ -94,7 +94,7 @@ class GeminiLlmConnection(BaseLlmConnection):
     else:
       logger.info('no content is sent')
 
-  async def send_content(self, content: types.Content):
+  async def send_content(self, content: types.Content) -> None:
     """Sends a user content to the gemini model.
 
     The model will respond immediately upon receiving the content.
@@ -103,6 +103,18 @@ class GeminiLlmConnection(BaseLlmConnection):
 
     Args:
       content: The content to send to the model.
+    """
+    await self._send_content(content)
+
+  async def _send_content(
+      self, content: types.Content, *, partial: bool = False
+  ) -> None:
+    """Sends content, optionally as a partial (non-turn-completing) update.
+
+    Args:
+      content: The content to send to the model.
+      partial: Whether this content is a partial turn update that does not
+        complete the model turn.
     """
     assert content.parts
     if content.parts[0].function_response:
@@ -115,11 +127,12 @@ class GeminiLlmConnection(BaseLlmConnection):
     else:
       logger.debug('Sending LLM new content %s', content)
       if (
-          self._is_gemini_3_1_flash_live
+          not partial
+          and self._is_gemini_3_x_live
           and len(content.parts) == 1
           and content.parts[0].text
       ):
-        logger.debug('Using send_realtime_input for Gemini 3.1 text input')
+        logger.debug('Using send_realtime_input for Gemini 3.x Live text input')
         await self._gemini_session.send_realtime_input(
             text=content.parts[0].text
         )
@@ -127,11 +140,11 @@ class GeminiLlmConnection(BaseLlmConnection):
         await self._gemini_session.send(
             input=types.LiveClientContent(
                 turns=[content],
-                turn_complete=True,
+                turn_complete=not partial,
             )
         )
 
-  async def send_realtime(self, input: RealtimeInput):
+  async def send_realtime(self, input: RealtimeInput) -> None:
     """Sends a chunk of audio or a frame of video to the model in realtime.
 
     Args:
@@ -140,7 +153,7 @@ class GeminiLlmConnection(BaseLlmConnection):
     if isinstance(input, types.Blob):
       # The blob is binary and is very large. So let's not log it.
       logger.debug('Sending LLM Blob.')
-      if self._is_gemini_3_1_flash_live or self._is_gemini_3_5_live_translate:
+      if self._is_gemini_3_x_live or self._is_gemini_3_5_live_translate:
         if input.mime_type and input.mime_type.startswith('audio/'):
           await self._gemini_session.send_realtime_input(audio=input)
         elif input.mime_type and input.mime_type.startswith('image/'):
@@ -212,7 +225,7 @@ class GeminiLlmConnection(BaseLlmConnection):
       is_thought: bool = False,
       grounding_metadata: types.GroundingMetadata | None = None,
       interrupted: bool = False,
-  ):
+  ) -> LlmResponse:
     """Builds a full text response.
 
     The text should not be partial and the returned LlmResponse is not
@@ -280,7 +293,7 @@ class GeminiLlmConnection(BaseLlmConnection):
 
     text = ''
     is_thought = False
-    tool_call_parts = []
+    tool_call_parts: list[types.Part] = []
     last_grounding_metadata = None
     tool_call_metadata = None
     async with Aclosing(self._gemini_session.receive()) as agen:
@@ -362,9 +375,9 @@ class GeminiLlmConnection(BaseLlmConnection):
           # generation_complete, causing transcription to appear after
           # tool_call in the session log.
           if message.server_content.input_transcription:
-            # Gemini 3.1 Flash Live only sends a single final input
+            # Gemini 3.x Live only sends a single final input
             # transcription
-            if self._is_gemini_3_1_flash_live:
+            if self._is_gemini_3_x_live:
               if message.server_content.input_transcription.text:
                 yield LlmResponse(
                     input_transcription=types.Transcription(
@@ -464,7 +477,7 @@ class GeminiLlmConnection(BaseLlmConnection):
                 or last_grounding_metadata
                 or (
                     types.GroundingMetadata()
-                    if self._is_gemini_3_1_flash_live
+                    if self._is_gemini_3_x_live
                     else None
                 )
             )
@@ -512,7 +525,7 @@ class GeminiLlmConnection(BaseLlmConnection):
                 or last_grounding_metadata
                 or (
                     types.GroundingMetadata()
-                    if self._is_gemini_3_1_flash_live
+                    if self._is_gemini_3_x_live
                     else None
                 ),
                 model_version=self._model_version,
@@ -559,17 +572,17 @@ class GeminiLlmConnection(BaseLlmConnection):
               types.Part(function_call=function_call)
               for function_call in message.tool_call.function_calls
           ])
-          if not self._is_gemini_3_1_flash_live:
+          if not self._is_gemini_3_x_live:
             if tool_call_metadata is None:
               tool_call_metadata = last_grounding_metadata
-          # Gemini 3.1 does not emit turn_complete until it receives the
+          # Gemini 3.x Live does not emit turn_complete until it receives the
           # tool response, so yield tool calls immediately to avoid
           # deadlocking the conversation. Other models (e.g. 2.5-pro,
           # native-audio) send turn_complete after tool calls, so buffer
           # and merge them into a single response at turn_complete.
-          if self._is_gemini_3_1_flash_live and tool_call_parts:
+          if self._is_gemini_3_x_live and tool_call_parts:
             logger.debug(
-                'Yielding tool_call_parts immediately for Gemini 3.1 live tool'
+                'Yielding tool_call_parts immediately for Gemini 3.x live tool'
                 ' call'
             )
             yield LlmResponse(
@@ -589,6 +602,13 @@ class GeminiLlmConnection(BaseLlmConnection):
                   live_session_id=live_session_id,
               )
           )
+        if message.voice_activity:
+          logger.debug('Received voice activity: %s', message.voice_activity)
+          yield LlmResponse(
+              voice_activity=message.voice_activity,
+              model_version=self._model_version,
+              live_session_id=live_session_id,
+          )
         if message.go_away:
           logger.debug('Received GoAway message: %s', message.go_away)
           yield LlmResponse(
@@ -605,7 +625,7 @@ class GeminiLlmConnection(BaseLlmConnection):
             live_session_id=self._gemini_session.session_id,
         )
 
-  async def close(self):
+  async def close(self) -> None:
     """Closes the llm server connection."""
 
     await self._gemini_session.close()

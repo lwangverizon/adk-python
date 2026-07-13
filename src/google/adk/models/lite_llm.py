@@ -543,9 +543,11 @@ def _convert_reasoning_value_to_parts(reasoning_value: Any) -> List[types.Part]:
           continue
         if block_type == "thinking":
           thinking_text = block.get("thinking", "")
-          if thinking_text:
+          signature = block.get("signature")
+          # Anthropic streams a signature in a final chunk with empty text.
+          # Preserve signature-only blocks so the signature survives aggregation.
+          if thinking_text or signature:
             part = types.Part(text=thinking_text, thought=True)
-            signature = block.get("signature")
             if signature:
               decoded_signature = _decode_thought_signature(signature)
               part.thought_signature = decoded_signature or str(
@@ -563,6 +565,43 @@ def _convert_reasoning_value_to_parts(reasoning_value: Any) -> List[types.Part]:
       for text in _iter_reasoning_texts(reasoning_value)
       if text
   ]
+
+
+def _aggregate_streaming_thought_parts(
+    thought_parts: Iterable[types.Part],
+) -> List[types.Part]:
+  """Aggregates fragmented streaming thought parts into clean individual parts.
+
+  During streaming, Anthropic splits a thinking block across many deltas:
+  text-only chunks followed by a signature-only chunk at block_stop. This helper
+  joins the text chunks and attaches the signature, producing clean individual
+  thought parts for session history and outbound requests.
+  """
+  parts_list = list(thought_parts)
+  if not parts_list:
+    return []
+  aggregated: List[types.Part] = []
+  current_texts: List[str] = []
+  for part in parts_list:
+    if part.text:
+      current_texts.append(part.text)
+    if part.thought_signature:
+      aggregated.append(
+          types.Part(
+              text="".join(current_texts),
+              thought=True,
+              thought_signature=part.thought_signature,
+          )
+      )
+      current_texts = []
+  if current_texts:
+    aggregated.append(
+        types.Part(
+            text="".join(current_texts),
+            thought=True,
+        )
+    )
+  return aggregated
 
 
 def _extract_reasoning_value(message: Message | Delta | None) -> Any:
@@ -620,7 +659,11 @@ class LiteLLMClient:
   """Provides acompletion method (for better testability)."""
 
   async def acompletion(
-      self, model, messages, tools, **kwargs
+      self,
+      model: Any,
+      messages: Any,
+      tools: Any,
+      **kwargs: Any,
   ) -> Union[ModelResponse, CustomStreamWrapper]:
     """Asynchronously calls acompletion.
 
@@ -643,7 +686,12 @@ class LiteLLMClient:
     )
 
   def completion(
-      self, model, messages, tools, stream=False, **kwargs
+      self,
+      model: Any,
+      messages: Any,
+      tools: Any,
+      stream: bool = False,
+      **kwargs: Any,
   ) -> Union[ModelResponse, CustomStreamWrapper]:
     """Synchronously calls completion. This is used for streaming only.
 
@@ -668,7 +716,7 @@ class LiteLLMClient:
     )
 
 
-def _safe_json_serialize(obj) -> str:
+def _safe_json_serialize(obj: object) -> str:
   """Convert any Python object to a JSON-serializable type or string.
 
   Args:
@@ -768,7 +816,7 @@ def _extract_cached_prompt_tokens(usage: Any) -> int:
       if isinstance(value, int):
         return value
     elif isinstance(details, list):
-      total = sum(
+      total: int = sum(
           item.get("cached_tokens", 0)
           for item in details
           if isinstance(item, dict)
@@ -841,6 +889,28 @@ def _extract_reasoning_tokens(usage: Any) -> int:
     logger.debug("Error extracting reasoning tokens: %s", e)
 
   return 0
+
+
+def _merge_reasoning_texts(reasoning_parts: Iterable[types.Part]) -> str:
+  """Merges reasoning text fragments into a single provider payload.
+
+  Streaming providers such as vLLM can emit reasoning as token-sized chunks.
+  ADK stores those chunks as consecutive thought parts, so inserting separators
+  here changes the model's original reasoning text.
+  """
+  reasoning_texts = []
+  for part in reasoning_parts:
+    if part.text:
+      reasoning_texts.append(part.text)
+    elif (
+        part.inline_data
+        and part.inline_data.data
+        and part.inline_data.mime_type
+        and part.inline_data.mime_type.startswith("text/")
+    ):
+      reasoning_texts.append(_decode_inline_text_data(part.inline_data.data))
+
+  return "".join(reasoning_texts)
 
 
 def _extract_thought_signature_from_tool_call(
@@ -1023,9 +1093,14 @@ async def _content_to_message_param(
     # For Anthropic models, rebuild thinking_blocks with signatures so that
     # thinking is preserved across tool call boundaries. Without this,
     # Anthropic silently drops thinking after the first turn.
+    #
+    # Streaming splits one Anthropic thinking block across many deltas:
+    # text-only chunks followed by a signature-only chunk at block_stop.
+    # Aggregate them back into one thinking block for outbound.
     if model and _is_anthropic_model(model) and reasoning_parts:
+      aggregated_parts = _aggregate_streaming_thought_parts(reasoning_parts)
       thinking_blocks = []
-      for part in reasoning_parts:
+      for part in aggregated_parts:
         if part.text and part.thought_signature:
           sig = part.thought_signature
           if isinstance(sig, bytes):
@@ -1043,18 +1118,6 @@ async def _content_to_message_param(
         )
         msg["thinking_blocks"] = thinking_blocks  # type: ignore[typeddict-unknown-key]
         return msg
-
-    reasoning_texts = []
-    for part in reasoning_parts:
-      if part.text:
-        reasoning_texts.append(part.text)
-      elif (
-          part.inline_data
-          and part.inline_data.data
-          and part.inline_data.mime_type
-          and part.inline_data.mime_type.startswith("text/")
-      ):
-        reasoning_texts.append(_decode_inline_text_data(part.inline_data.data))
 
     # Anthropic routes require thinking blocks to be embedded directly in the
     # message content list. LiteLLM's prompt template for Anthropic drops the
@@ -1084,9 +1147,7 @@ async def _content_to_message_param(
           tool_calls=tool_calls or None,
       )
 
-    # Preserve reasoning deltas exactly as received. Injecting separators
-    # between fragments can corrupt provider-streamed thinking text.
-    reasoning_content = "".join(text for text in reasoning_texts if text)
+    reasoning_content = _merge_reasoning_texts(reasoning_parts)
     return ChatCompletionAssistantMessage(
         role=role,
         content=final_content,
@@ -1494,15 +1555,172 @@ def _build_tool_call_from_json_dict(
   return tool_call
 
 
+# DeepSeek models may emit tool calls as inline text using proprietary
+# special tokens. See https://api-docs.deepseek.com/guides/function_calling
+# for the full specification. LiteLLM usually translates these into
+# structured `tool_calls` but when it doesn't (intermittent), the raw
+# tokens land in the `content` field and must be parsed here.
+_DS_TCALLS_BEGIN = "\u003c\uff5ctool\u2581calls\u2581begin\uff5c\u003e"
+_DS_TCALLS_END = "\u003c\uff5ctool\u2581calls\u2581end\uff5c\u003e"
+_DS_TCALL_BEGIN = "\u003c\uff5ctool\u2581call\u2581begin\uff5c\u003e"
+_DS_TCALL_END = "\u003c\uff5ctool\u2581call\u2581end\uff5c\u003e"
+_DS_TSEP = "\u003c\uff5ctool\u2581sep\uff5c\u003e"
+
+# Pattern: <｜tool▁call▁begin｜>function<｜tool▁sep｜>NAME \n ARGS <｜tool▁call▁end｜>
+_DS_TOOL_CALL_RE = re.compile(
+    re.escape(_DS_TCALL_BEGIN)
+    + r"function"
+    + re.escape(_DS_TSEP)
+    + r"([^\n\r]+?)\s*?\n(.*?)"
+    + re.escape(_DS_TCALL_END),
+    re.DOTALL,
+)
+
+
+def _extract_json_from_deepseek_args(args_text: str) -> Optional[str]:
+  """Extracts a JSON string from DeepSeek arguments text.
+
+  Args:
+    args_text: Raw text containing the function arguments, possibly
+      wrapped in Markdown-style code fences.
+
+  Returns:
+    The JSON string, or None if no valid JSON object could be found.
+  """
+  if not args_text:
+    return None
+  # Strip optional Markdown code fences (```json ... ``` or ``` ... ```).
+  fence_match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", args_text)
+  if fence_match:
+    candidate = fence_match.group(1).strip()
+    try:
+      json.loads(candidate)
+      return candidate
+    except json.JSONDecodeError:
+      pass
+  # Fall back to the first balanced { … } block.
+  open_brace = args_text.find("{")
+  if open_brace == -1:
+    return None
+  try:
+    candidate, _ = _JSON_DECODER.raw_decode(args_text, open_brace)
+    return json.dumps(candidate, ensure_ascii=False)
+  except json.JSONDecodeError:
+    return None
+
+
+def _parse_deepseek_tool_calls_from_text(
+    text_block: str,
+) -> tuple[list[ChatCompletionMessageToolCall], Optional[str]]:
+  """Parses DeepSeek proprietary inline tool-call tokens from text.
+
+  When LiteLLM does not translate DeepSeek's special tokens into
+  structured ``tool_calls``, the raw tokens appear inside the ``content``
+  field.  This function extracts them and returns standard
+  ``ChatCompletionMessageToolCall`` objects.
+
+  Token reference
+    ``<｜tool▁calls▁begin｜>`` … ``<｜tool▁calls▁end｜>``  → outer wrapper
+    ``<｜tool▁call▁begin｜>function<｜tool▁sep｜>NAME``  → single call start
+    ``<｜tool▁call▁end｜>``                             → single call end
+
+  Args:
+    text_block: The raw text that may contain DeepSeek tokens.
+
+  Returns:
+    A tuple of ``(tool_calls, remainder)`` where ``remainder`` is the
+    original text with all DeepSeek token regions removed.
+  """
+  _ensure_litellm_imported()
+
+  tool_calls: list[ChatCompletionMessageToolCall] = []
+  if not text_block:
+    return tool_calls, None
+
+  # Quick guard: only invoke the regex if the outer tokens are present.
+  if _DS_TCALLS_BEGIN not in text_block and _DS_TCALL_BEGIN not in text_block:
+    return tool_calls, None
+
+  remainder_parts: list[str] = []
+  cursor = 0
+
+  # Outer loop — wrapped <｜tool▁calls▁begin｜> blocks and unwrapped
+  # <｜tool▁call▁begin｜> tokens may interleave, so process whichever
+  # token appears first.
+  while True:
+    calls_idx = text_block.find(_DS_TCALLS_BEGIN, cursor)
+    call_idx = text_block.find(_DS_TCALL_BEGIN, cursor)
+    if calls_idx == -1 and call_idx == -1:
+      remainder_parts.append(text_block[cursor:])
+      break
+
+    if calls_idx != -1 and (call_idx == -1 or calls_idx < call_idx):
+      begin_idx = calls_idx
+      in_wrapped_block = True
+    else:
+      begin_idx = call_idx
+      in_wrapped_block = False
+
+    # Everything before the token becomes remainder.
+    if begin_idx > cursor:
+      remainder_parts.append(text_block[cursor:begin_idx])
+
+    if in_wrapped_block:
+      end_idx = text_block.find(
+          _DS_TCALLS_END, begin_idx + len(_DS_TCALLS_BEGIN)
+      )
+      if end_idx == -1:
+        remainder_parts.append(text_block[begin_idx:])
+        break
+      block = text_block[begin_idx + len(_DS_TCALLS_BEGIN) : end_idx]
+      cursor = end_idx + len(_DS_TCALLS_END)
+    else:
+      # Unwrapped call token — scan for a matching end token.
+      end_idx = text_block.find(_DS_TCALL_END, begin_idx + len(_DS_TCALL_BEGIN))
+      if end_idx == -1:
+        remainder_parts.append(text_block[begin_idx:])
+        break
+      block = text_block[begin_idx : end_idx + len(_DS_TCALL_END)]
+      cursor = end_idx + len(_DS_TCALL_END)
+
+    # Parse individual tool calls inside the block.
+    for match in _DS_TOOL_CALL_RE.finditer(block):
+      func_name = match.group(1).strip()
+      args_raw = match.group(2).strip()
+      args_json = _extract_json_from_deepseek_args(args_raw)
+      if not func_name or not args_json:
+        continue
+      tool_call = _build_tool_call_from_json_dict(
+          {"name": func_name, "arguments": args_json},
+          index=len(tool_calls),
+      )
+      if tool_call:
+        tool_calls.append(tool_call)
+
+  remainder = "".join(p for p in remainder_parts if p).strip()
+  return tool_calls, remainder or None
+
+
 def _parse_tool_calls_from_text(
     text_block: str,
 ) -> tuple[list[ChatCompletionMessageToolCall], Optional[str]]:
   """Extracts inline JSON tool calls from LiteLLM text responses."""
-  tool_calls = []
+  tool_calls: list[ChatCompletionMessageToolCall] = []
   if not text_block:
     return tool_calls, None
 
   _ensure_litellm_imported()
+
+  # Try DeepSeek proprietary format first, then fall back to generic JSON.
+  ds_tool_calls, ds_remainder = _parse_deepseek_tool_calls_from_text(text_block)
+  if ds_tool_calls:
+    # If the remainder still contains content, re-parse it for
+    # additional generic inline JSON tool calls (mixed formats).
+    if ds_remainder:
+      extra_calls, extra_remainder = _parse_tool_calls_from_text(ds_remainder)
+      tool_calls = ds_tool_calls + (extra_calls or [])
+      return tool_calls, extra_remainder
+    return ds_tool_calls, None
 
   remainder_segments = []
   cursor = 0
@@ -1584,7 +1802,7 @@ TYPE_LABELS = {
 }
 
 
-def _schema_to_dict(schema: types.Schema | dict[str, Any]) -> dict:
+def _schema_to_dict(schema: types.Schema | dict[str, Any]) -> dict[str, Any]:
   """Recursively converts a schema object or dict to a pure-python dict.
 
   Args:
@@ -1630,7 +1848,7 @@ def _schema_to_dict(schema: types.Schema | dict[str, Any]) -> dict:
 
 def _function_declaration_to_tool_param(
     function_declaration: types.FunctionDeclaration,
-) -> dict:
+) -> dict[str, Any]:
   """Converts a types.FunctionDeclaration to an openapi spec dictionary.
 
   Args:
@@ -1720,6 +1938,7 @@ def _model_response_to_chunk(
         or message.get("function_call")
         or message.get("reasoning_content")
         or message.get("reasoning")
+        or message.get("thinking_blocks")
     )
 
   if isinstance(response, ModelResponseStream):
@@ -2095,9 +2314,9 @@ async def _get_completion_inputs(
     model: str,
 ) -> Tuple[
     List[Message],
-    Optional[List[Dict]],
+    Optional[List[Dict[str, Any]]],
     Optional[Dict[str, Any]],
-    Optional[Dict],
+    Optional[Dict[str, Any]],
 ]:
   """Converts an LlmRequest to litellm inputs and extracts generation params.
 
@@ -2136,7 +2355,7 @@ async def _get_completion_inputs(
   messages = _ensure_tool_results(messages, model)
 
   # 2. Convert tool declarations
-  tools: Optional[List[Dict]] = None
+  tools: Optional[List[Dict[str, Any]]] = None
   if (
       llm_request.config
       and llm_request.config.tools
@@ -2156,7 +2375,7 @@ async def _get_completion_inputs(
     )
 
   # 4. Extract generation parameters
-  generation_params: dict | None = None
+  generation_params: dict[str, Any] | None = None
   if llm_request.config:
     config_dict = llm_request.config.model_dump(exclude_none=True)
     # Generate LiteLlm parameters here,
@@ -2354,6 +2573,50 @@ def _warn_gemini_via_litellm(model_string: str) -> None:
   )
 
 
+class _BraceDepthTracker:
+  """Streams JSON characters and reports when a top-level object closes.
+
+  Only `{`/`}` are counted; `[`/`]` are ignored. Tool-call arguments per
+  the OpenAI/LiteLLM spec are always top-level JSON objects, never arrays,
+  so array depth is irrelevant for detecting when the top-level container
+  closes. Arrays nested as values (e.g. `{"a": [{"b": 1}]}`) still balance
+  correctly because chars inside the array don't change brace depth.
+  """
+
+  __slots__ = ("_depth", "_in_string", "_escaped", "_seen_open")
+
+  def __init__(self) -> None:
+    self._depth = 0
+    self._in_string = False
+    self._escaped = False
+    self._seen_open = False
+
+  def feed(self, fragment: str) -> bool:
+    """Feeds new chars; returns True iff a top-level object just closed."""
+    closed = False
+    for ch in fragment:
+      if self._in_string:
+        if self._escaped:
+          self._escaped = False
+        elif ch == "\\":
+          self._escaped = True
+        elif ch == '"':
+          self._in_string = False
+        continue
+      if ch == '"':
+        self._in_string = True
+      elif ch == "{":
+        self._depth += 1
+        self._seen_open = True
+      elif ch == "}":
+        if self._depth > 0:
+          self._depth -= 1
+          if self._depth == 0 and self._seen_open:
+            closed = True
+            self._seen_open = False
+    return closed
+
+
 def _redirect_litellm_loggers_to_stdout() -> None:
   """Redirects LiteLLM loggers from stderr to stdout.
 
@@ -2401,7 +2664,7 @@ class LiteLlm(BaseLlm):
 
   _additional_args: Dict[str, Any] = None
 
-  def __init__(self, model: str, **kwargs):
+  def __init__(self, model: str, **kwargs: Any) -> None:
     """Initializes the LiteLlm class.
 
     Args:
@@ -2456,7 +2719,7 @@ class LiteLlm(BaseLlm):
       # LiteLLM does not support both tools and functions together.
       tools = None
 
-    completion_args = {
+    completion_args: dict[str, Any] = {
         "model": effective_model,
         "messages": normalized_messages,
         "tools": tools,
@@ -2475,11 +2738,38 @@ class LiteLlm(BaseLlm):
     if generation_params:
       completion_args.update(generation_params)
 
+    if llm_request.config.http_options:
+      http_opts = llm_request.config.http_options
+      if http_opts.headers:
+        extra_headers = completion_args.get("extra_headers", {})
+        if isinstance(extra_headers, dict):
+          extra_headers = extra_headers.copy()
+        else:
+          extra_headers = {}
+        extra_headers.update(http_opts.headers)
+        completion_args["extra_headers"] = extra_headers
+
+      if http_opts.timeout is not None:
+        completion_args["timeout"] = http_opts.timeout
+
+      if (
+          http_opts.retry_options is not None
+          and http_opts.retry_options.attempts is not None
+      ):
+        # LiteLLM accepts num_retries as a top-level parameter.
+        completion_args["num_retries"] = http_opts.retry_options.attempts
+
+      if http_opts.extra_body is not None:
+        completion_args["extra_body"] = http_opts.extra_body
+
     if stream:
       text = ""
       reasoning_parts: List[types.Part] = []
       # Track function calls by index
-      function_calls = {}  # index -> {name, args, id}
+      function_calls: dict[int, dict[str, Any]] = (
+          {}
+      )  # index -> {name, args, id}
+      tool_call_trackers: Dict[int, _BraceDepthTracker] = {}
       completion_args["stream"] = True
       completion_args["stream_options"] = {"include_usage": True}
       aggregated_llm_response = None
@@ -2569,6 +2859,7 @@ class LiteLlm(BaseLlm):
         text = ""
         reasoning_parts = []
         function_calls.clear()
+        tool_call_trackers.clear()
 
       async for part in await self.llm_client.acompletion(**completion_args):
         # Grounding metadata can arrive on the first chunk (search queries) or
@@ -2587,13 +2878,17 @@ class LiteLlm(BaseLlm):
             if chunk.args:
               function_calls[index]["args"] += chunk.args
 
-              # check if args is completed (workaround for improper chunk
-              # indexing)
-              try:
-                json.loads(function_calls[index]["args"])
-                fallback_index += 1
-              except json.JSONDecodeError:
-                pass
+              # Detect args completion to advance fallback_index (workaround
+              # for improper chunk indexing) without O(N^2) re-parsing.
+              tracker = tool_call_trackers.setdefault(
+                  index, _BraceDepthTracker()
+              )
+              if tracker.feed(chunk.args):
+                try:
+                  json.loads(function_calls[index]["args"])
+                  fallback_index += 1
+                except json.JSONDecodeError:
+                  pass
 
             function_calls[index]["id"] = (
                 chunk.id or function_calls[index]["id"] or str(index)

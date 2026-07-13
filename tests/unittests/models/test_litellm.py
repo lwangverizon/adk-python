@@ -27,10 +27,13 @@ from unittest.mock import Mock
 from unittest.mock import patch
 import warnings
 
+from google.adk.models.lite_llm import _aggregate_streaming_thought_parts
 from google.adk.models.lite_llm import _append_fallback_user_content_if_missing
+from google.adk.models.lite_llm import _BraceDepthTracker
 from google.adk.models.lite_llm import _content_to_message_param
 from google.adk.models.lite_llm import _convert_reasoning_value_to_parts
 from google.adk.models.lite_llm import _enforce_strict_openai_schema
+from google.adk.models.lite_llm import _extract_json_from_deepseek_args
 from google.adk.models.lite_llm import _extract_reasoning_value
 from google.adk.models.lite_llm import _extract_thought_signature_from_tool_call
 from google.adk.models.lite_llm import _FILE_ID_REQUIRED_PROVIDERS
@@ -47,6 +50,7 @@ from google.adk.models.lite_llm import _message_to_generate_content_response
 from google.adk.models.lite_llm import _MISSING_TOOL_RESULT_MESSAGE
 from google.adk.models.lite_llm import _model_response_to_chunk
 from google.adk.models.lite_llm import _model_response_to_generate_content_response
+from google.adk.models.lite_llm import _parse_deepseek_tool_calls_from_text
 from google.adk.models.lite_llm import _parse_tool_calls_from_text
 from google.adk.models.lite_llm import _redact_file_uri_for_log
 from google.adk.models.lite_llm import _redirect_litellm_loggers_to_stdout
@@ -2201,6 +2205,25 @@ async def test_content_to_message_param_assistant_thought_message():
 
 
 @pytest.mark.asyncio
+async def test_content_to_message_param_merges_reasoning_chunks_without_separator():
+  first_part = types.Part.from_text(text="Let")
+  first_part.thought = True
+  second_part = types.Part.from_text(text=" me think")
+  second_part.thought = True
+  third_part = types.Part.from_text(text=" this through.")
+  third_part.thought = True
+  content = types.Content(
+      role="assistant", parts=[first_part, second_part, third_part]
+  )
+
+  message = await _content_to_message_param(content)
+
+  assert message["role"] == "assistant"
+  assert message["content"] is None
+  assert message["reasoning_content"] == "Let me think this through."
+
+
+@pytest.mark.asyncio
 async def test_content_to_message_param_model_thought_message():
   part = types.Part.from_text(text="internal reasoning")
   part.thought = True
@@ -2909,6 +2932,145 @@ def test_parse_tool_calls_from_text_invalid_json_returns_remainder():
   tool_calls, remainder = _parse_tool_calls_from_text(text)
   assert tool_calls == []
   assert remainder == 'Leading {"unused": "payload"} trailing text'
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek proprietary inline tool-call format tests
+# ---------------------------------------------------------------------------
+
+_DS_BEGIN_CALLS = "\u003c\uff5ctool\u2581calls\u2581begin\uff5c\u003e"
+_DS_END_CALLS = "\u003c\uff5ctool\u2581calls\u2581end\uff5c\u003e"
+_DS_BEGIN_CALL = "\u003c\uff5ctool\u2581call\u2581begin\uff5c\u003e"
+_DS_END_CALL = "\u003c\uff5ctool\u2581call\u2581end\uff5c\u003e"
+_DS_SEP = "\u003c\uff5ctool\u2581sep\uff5c\u003e"
+
+
+def _ds_tool_call(name: str, args_json: str) -> str:
+  """Build a single DeepSeek-style tool-call block."""
+  return (
+      f"{_DS_BEGIN_CALL}function{_DS_SEP}{name}\n"
+      f"```json\n{args_json}\n```"
+      f"{_DS_END_CALL}"
+  )
+
+
+def _ds_wrapped(inner: str) -> str:
+  """Wrap content in <｜tool▁calls▁begin｜>...<｜tool▁calls▁end｜>."""
+  return f"{_DS_BEGIN_CALLS}{inner}{_DS_END_CALLS}"
+
+
+def test_parse_deepseek_single_tool_call():
+  """Single DeepSeek tool call with code-fenced JSON args."""
+  text = _ds_wrapped(
+      _ds_tool_call("get_weather", '{"city": "Beijing", "unit": "celsius"}')
+  )
+  tool_calls, remainder = _parse_deepseek_tool_calls_from_text(text)
+  assert len(tool_calls) == 1
+  assert tool_calls[0].function.name == "get_weather"
+  assert json.loads(tool_calls[0].function.arguments) == {
+      "city": "Beijing",
+      "unit": "celsius",
+  }
+  assert remainder is None
+
+
+def test_parse_deepseek_multi_tool_call():
+  """Multiple DeepSeek tool calls in a single wrapped block."""
+  inner = _ds_tool_call("func_a", '{"x": 1}') + _ds_tool_call(
+      "func_b", '{"y": 2}'
+  )
+  text = _ds_wrapped(inner)
+  tool_calls, remainder = _parse_deepseek_tool_calls_from_text(text)
+  assert len(tool_calls) == 2
+  assert tool_calls[0].function.name == "func_a"
+  assert json.loads(tool_calls[0].function.arguments) == {"x": 1}
+  assert tool_calls[1].function.name == "func_b"
+  assert json.loads(tool_calls[1].function.arguments) == {"y": 2}
+  assert remainder is None
+
+
+def test_parse_deepseek_plain_json_args():
+  """DeepSeek tool call without Markdown code fences around args."""
+  inner = (
+      f"{_DS_BEGIN_CALL}function{_DS_SEP}search\n"
+      f'{{"query": "天气"}}'
+      f"{_DS_END_CALL}"
+  )
+  text = _ds_wrapped(inner)
+  tool_calls, remainder = _parse_deepseek_tool_calls_from_text(text)
+  assert len(tool_calls) == 1
+  assert tool_calls[0].function.name == "search"
+  assert json.loads(tool_calls[0].function.arguments) == {"query": "天气"}
+
+
+def test_parse_deepseek_with_surrounding_text():
+  """DeepSeek tool call embedded in surrounding non-tool text."""
+  prefix = "Let me think about this.\n"
+  suffix = "\nI'll proceed now."
+  inner = _ds_tool_call("calculate", '{"expr": "2+2"}')
+  text = prefix + _ds_wrapped(inner) + suffix
+  tool_calls, remainder = _parse_deepseek_tool_calls_from_text(text)
+  assert len(tool_calls) == 1
+  assert tool_calls[0].function.name == "calculate"
+  assert remainder == "Let me think about this.\n\nI'll proceed now."
+
+
+def test_parse_deepseek_no_tokens_returns_empty():
+  """Text without DeepSeek tokens returns no tool calls and None remainder."""
+  text = "Just a regular response, no special tokens here."
+  tool_calls, remainder = _parse_deepseek_tool_calls_from_text(text)
+  assert tool_calls == []
+  assert remainder is None
+
+
+def test_parse_tool_calls_from_text_handles_deepseek_format():
+  """Integration: the generic parser delegates to the DeepSeek parser."""
+  text = _ds_wrapped(
+      _ds_tool_call("fetch_page", '{"url": "https://example.com"}')
+  )
+  tool_calls, remainder = _parse_tool_calls_from_text(text)
+  assert len(tool_calls) == 1
+  assert tool_calls[0].function.name == "fetch_page"
+  assert json.loads(tool_calls[0].function.arguments) == {
+      "url": "https://example.com"
+  }
+  assert remainder is None
+
+
+def test_parse_tool_calls_from_text_mixed_formats():
+  """DeepSeek tokens + standard inline JSON in the same text."""
+  ds_part = _ds_wrapped(_ds_tool_call("ds_func", '{"a": 1}'))
+  standard_part = '{"name": "std_func", "arguments": {"b": 2}}'
+  text = ds_part + " some text " + standard_part
+  tool_calls, remainder = _parse_tool_calls_from_text(text)
+  assert len(tool_calls) == 2
+  assert tool_calls[0].function.name == "ds_func"
+  assert tool_calls[1].function.name == "std_func"
+  assert remainder == "some text"
+
+
+def test_parse_deepseek_empty_text():
+  """Empty or whitespace-only text returns no tool calls."""
+  for text in ("", "   ", "\n\n"):
+    tool_calls, remainder = _parse_deepseek_tool_calls_from_text(text)
+    assert tool_calls == []
+    assert remainder is None
+
+
+def test_parse_deepseek_unwrapped_call_before_wrapped_block():
+  """Unwrapped call preceding a wrapped block is not dropped."""
+  unwrapped = _ds_tool_call("first", '{"x": 1}')
+  wrapped = _ds_wrapped(_ds_tool_call("second", '{"y": 2}'))
+  tool_calls, remainder = _parse_deepseek_tool_calls_from_text(
+      unwrapped + wrapped
+  )
+  assert [tc.function.name for tc in tool_calls] == ["first", "second"]
+  assert remainder is None
+
+
+def test_extract_json_from_deepseek_args_invalid_fence_returns_none():
+  """Invalid JSON inside a code fence is rejected rather than returned."""
+  assert _extract_json_from_deepseek_args('```json\n{"a": 1,}\n```') is None
 
 
 def test_split_message_content_and_tool_calls_inline_text():
@@ -5255,15 +5417,48 @@ def test_convert_reasoning_value_to_parts_skips_redacted_blocks():
   assert parts[0].text == "visible"
 
 
-def test_convert_reasoning_value_to_parts_skips_empty_thinking():
-  """Blocks with empty thinking text are excluded."""
+def test_convert_reasoning_value_to_parts_preserves_signature_only_blocks():
+  """Signature-only blocks (empty text) are preserved for streaming aggregation.
+
+  Anthropic emits the block_stop signature as a delta with empty thinking text.
+  Dropping it would lose the signature, breaking multi-turn thinking continuity.
+  Blocks with neither text nor signature are still skipped.
+  """
   thinking_blocks = [
       {"type": "thinking", "thinking": "", "signature": "c2lnMQ=="},
       {"type": "thinking", "thinking": "real thought", "signature": "c2lnMg=="},
+      {
+          "type": "thinking",
+          "thinking": "",
+          "signature": "",
+      },  # fully empty: drop
   ]
   parts = _convert_reasoning_value_to_parts(thinking_blocks)
-  assert len(parts) == 1
-  assert parts[0].text == "real thought"
+  assert len(parts) == 2
+  assert parts[0].text == ""
+  assert parts[0].thought is True
+  assert parts[0].thought_signature == b"sig1"
+  assert parts[1].text == "real thought"
+  assert parts[1].thought_signature == b"sig2"
+
+
+def test_aggregate_streaming_thought_parts():
+  """Tests aggregating fragmented streaming thought parts and multiple blocks."""
+  parts = [
+      types.Part(text="First block ", thought=True),
+      types.Part(text="text.", thought=True),
+      types.Part(text="", thought=True, thought_signature=b"sig1"),
+      types.Part(text="Second block", thought=True, thought_signature=b"sig2"),
+      types.Part(text="Trailing without sig", thought=True),
+  ]
+  aggregated = _aggregate_streaming_thought_parts(parts)
+  assert len(aggregated) == 3
+  assert aggregated[0].text == "First block text."
+  assert aggregated[0].thought_signature == b"sig1"
+  assert aggregated[1].text == "Second block"
+  assert aggregated[1].thought_signature == b"sig2"
+  assert aggregated[2].text == "Trailing without sig"
+  assert aggregated[2].thought_signature is None
 
 
 def test_convert_reasoning_value_to_parts_flat_string_unchanged():
@@ -5335,6 +5530,33 @@ async def test_content_to_message_param_anthropic_model_round_trip_preserves_sig
       "signature": "c2lnX2E=",
   }]
   assert result.get("reasoning_content") is None
+
+
+@pytest.mark.asyncio
+async def test_content_to_message_param_anthropic_split_thinking_and_signature():
+  """Combines separate thinking and signature parts into a single thinking_block."""
+  content = types.Content(
+      role="model",
+      parts=[
+          types.Part(text="deep thought", thought=True),
+          types.Part(
+              text="", thought=True, thought_signature=b"sig_round_trip"
+          ),
+          types.Part(text="Hello!"),
+      ],
+  )
+  result = await _content_to_message_param(
+      content, model="anthropic/claude-4-sonnet"
+  )
+  assert result["role"] == "assistant"
+  assert "thinking_blocks" in result
+  assert result.get("reasoning_content") is None
+  blocks = result["thinking_blocks"]
+  assert len(blocks) == 1
+  assert blocks[0]["type"] == "thinking"
+  assert blocks[0]["thinking"] == "deep thought"
+  assert blocks[0]["signature"] == "c2lnX3JvdW5kX3RyaXA="
+  assert result["content"] == "Hello!"
 
 
 @pytest.mark.asyncio
@@ -5436,7 +5658,7 @@ def test_convert_reasoning_value_to_parts_empty_thinking_does_not_fall_through()
           "type": "thinking",
           "thinking": "",
           "text": "leaked",
-          "signature": "c2ln",
+          "signature": "",
       },
   ]
   parts = _convert_reasoning_value_to_parts(thinking_blocks)
@@ -5538,6 +5760,76 @@ async def test_content_to_message_param_anthropic_provider_embeds_thinking_block
 
 
 @pytest.mark.asyncio
+async def test_content_to_message_param_anthropic_aggregates_streaming_split_thinking():
+  """Streaming splits one Anthropic thinking block across many parts:
+  text-only chunks followed by a signature-only chunk at block_stop.
+  _content_to_message_param must re-join them into one thinking_block.
+  """
+  content = types.Content(
+      role="model",
+      parts=[
+          # Text-only chunks from streaming deltas (no signature)
+          types.Part(text="The user wants ", thought=True),
+          types.Part(text="GST research ", thought=True),
+          types.Part(text="on secondment.", thought=True),
+          # Final signature-only chunk (empty text, signature carries the whole block)
+          types.Part(
+              text="", thought=True, thought_signature=b"ErEDClsIDBACGAIfull"
+          ),
+          # Non-thought response content
+          types.Part.from_function_call(name="create_plan", args={"q": "test"}),
+      ],
+  )
+  result = await _content_to_message_param(
+      content, model="anthropic/claude-4-sonnet"
+  )
+  # One aggregated thinking block with combined text and the block's signature
+  blocks = result["thinking_blocks"]
+  assert len(blocks) == 1
+  assert blocks[0]["type"] == "thinking"
+  assert blocks[0]["thinking"] == "The user wants GST research on secondment."
+  assert blocks[0]["signature"] == "RXJFRENsc0lEQkFDR0FJZnVsbA=="
+  # Legacy reasoning_content is not set when the Anthropic branch takes
+  assert result.get("reasoning_content") is None
+
+
+def test_model_response_to_chunk_preserves_signature_only_delta():
+  """Anthropic streams a final thinking delta where content and
+  reasoning_content are empty but thinking_blocks carries the signature.
+  _has_meaningful_signal must recognize thinking_blocks as signal so the
+  signature survives into a ReasoningChunk.
+  """
+  stream = ModelResponseStream(
+      id="x",
+      created=0,
+      model="claude",
+      choices=[
+          StreamingChoices(
+              index=0,
+              delta=Delta(
+                  role=None,
+                  content="",
+                  reasoning_content="",
+                  thinking_blocks=[{
+                      "type": "thinking",
+                      "thinking": "",
+                      "signature": "SignatureOnlyChunk",
+                  }],
+              ),
+          )
+      ],
+  )
+  chunks = list(_model_response_to_chunk(stream))
+  reasoning_chunks = [c for c, _ in chunks if isinstance(c, ReasoningChunk)]
+  assert len(reasoning_chunks) == 1
+  parts = reasoning_chunks[0].parts
+  assert len(parts) == 1
+  assert parts[0].text == ""
+  assert parts[0].thought is True
+  assert parts[0].thought_signature == b"SignatureOnlyChunk"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "log_level,should_call",
     [
@@ -5607,3 +5899,440 @@ def test_redact_file_uri_for_log_http_url_keeps_scheme_and_tail():
       _redact_file_uri_for_log("https://example.com/path/file.pdf")
       == "https://<redacted>/file.pdf"
   )
+
+
+@pytest.mark.asyncio
+async def test_generate_content_async_passes_http_options_headers_as_extra_headers(
+    mock_acompletion, lite_llm_instance
+):
+  """Test that http_options.headers from LlmRequest are forwarded to litellm."""
+  llm_request = LlmRequest(
+      contents=[
+          types.Content(
+              role="user", parts=[types.Part.from_text(text="Test prompt")]
+          )
+      ],
+      config=types.GenerateContentConfig(
+          http_options=types.HttpOptions(
+              headers={"X-User-Id": "user-123", "X-Trace-Id": "trace-abc"}
+          )
+      ),
+  )
+
+  async for _ in lite_llm_instance.generate_content_async(llm_request):
+    pass
+
+  mock_acompletion.assert_called_once()
+  _, kwargs = mock_acompletion.call_args
+  assert "extra_headers" in kwargs
+  assert kwargs["extra_headers"]["X-User-Id"] == "user-123"
+  assert kwargs["extra_headers"]["X-Trace-Id"] == "trace-abc"
+
+
+@pytest.mark.asyncio
+async def test_generate_content_async_merges_http_options_with_existing_extra_headers(
+    mock_response,
+):
+  """Test that http_options.headers merge with pre-existing extra_headers."""
+  mock_acompletion = AsyncMock(return_value=mock_response)
+  mock_client = MockLLMClient(mock_acompletion, Mock())
+  # Create instance with pre-existing extra_headers via kwargs
+  lite_llm_with_extra = LiteLlm(
+      model="test_model",
+      llm_client=mock_client,
+      extra_headers={"X-Api-Key": "secret-key"},
+  )
+
+  llm_request = LlmRequest(
+      contents=[
+          types.Content(
+              role="user", parts=[types.Part.from_text(text="Test prompt")]
+          )
+      ],
+      config=types.GenerateContentConfig(
+          http_options=types.HttpOptions(headers={"X-User-Id": "user-456"})
+      ),
+  )
+
+  async for _ in lite_llm_with_extra.generate_content_async(llm_request):
+    pass
+
+  mock_acompletion.assert_called_once()
+  _, kwargs = mock_acompletion.call_args
+  assert "extra_headers" in kwargs
+  # Both existing and new headers should be present
+  assert kwargs["extra_headers"]["X-Api-Key"] == "secret-key"
+  assert kwargs["extra_headers"]["X-User-Id"] == "user-456"
+
+
+@pytest.mark.asyncio
+async def test_generate_content_async_http_options_headers_override_existing(
+    mock_response,
+):
+  """Test that http_options.headers override same-key extra_headers from init."""
+  mock_acompletion = AsyncMock(return_value=mock_response)
+  mock_client = MockLLMClient(mock_acompletion, Mock())
+  lite_llm_with_extra = LiteLlm(
+      model="test_model",
+      llm_client=mock_client,
+      extra_headers={"X-Override-Me": "old-value"},
+  )
+
+  llm_request = LlmRequest(
+      contents=[
+          types.Content(
+              role="user", parts=[types.Part.from_text(text="Test prompt")]
+          )
+      ],
+      config=types.GenerateContentConfig(
+          http_options=types.HttpOptions(headers={"X-Override-Me": "new-value"})
+      ),
+  )
+
+  async for _ in lite_llm_with_extra.generate_content_async(llm_request):
+    pass
+
+  mock_acompletion.assert_called_once()
+  _, kwargs = mock_acompletion.call_args
+  # Request-level headers should override init-level headers
+  assert kwargs["extra_headers"]["X-Override-Me"] == "new-value"
+
+
+@pytest.mark.asyncio
+async def test_generate_content_async_passes_http_options_timeout(
+    mock_acompletion, lite_llm_instance
+):
+  """Test that http_options.timeout is forwarded to litellm."""
+
+  llm_request = LlmRequest(
+      contents=[
+          types.Content(
+              role="user", parts=[types.Part.from_text(text="Test prompt")]
+          )
+      ],
+      config=types.GenerateContentConfig(
+          http_options=types.HttpOptions(timeout=30000)
+      ),
+  )
+
+  async for _ in lite_llm_instance.generate_content_async(llm_request):
+    pass
+
+  mock_acompletion.assert_called_once()
+  _, kwargs = mock_acompletion.call_args
+  assert "timeout" in kwargs
+  assert kwargs["timeout"] == 30000
+
+
+@pytest.mark.asyncio
+async def test_generate_content_async_passes_http_options_retry_options(
+    mock_acompletion, lite_llm_instance
+):
+  """Test that http_options.retry_options is forwarded to litellm."""
+
+  llm_request = LlmRequest(
+      contents=[
+          types.Content(
+              role="user", parts=[types.Part.from_text(text="Test prompt")]
+          )
+      ],
+      config=types.GenerateContentConfig(
+          http_options=types.HttpOptions(
+              retry_options=types.HttpRetryOptions(
+                  attempts=3,
+              )
+          )
+      ),
+  )
+
+  async for _ in lite_llm_instance.generate_content_async(llm_request):
+    pass
+
+  mock_acompletion.assert_called_once()
+  _, kwargs = mock_acompletion.call_args
+  assert "num_retries" in kwargs
+  assert kwargs["num_retries"] == 3
+
+
+@pytest.mark.asyncio
+async def test_generate_content_async_passes_http_options_extra_body(
+    mock_acompletion, lite_llm_instance
+):
+  """Test that http_options.extra_body is forwarded to litellm."""
+
+  llm_request = LlmRequest(
+      contents=[
+          types.Content(
+              role="user", parts=[types.Part.from_text(text="Test prompt")]
+          )
+      ],
+      config=types.GenerateContentConfig(
+          http_options=types.HttpOptions(
+              extra_body={"custom_field": "custom_value", "priority": "high"}
+          )
+      ),
+  )
+
+  async for _ in lite_llm_instance.generate_content_async(llm_request):
+    pass
+
+  mock_acompletion.assert_called_once()
+  _, kwargs = mock_acompletion.call_args
+  assert "extra_body" in kwargs
+  assert kwargs["extra_body"]["custom_field"] == "custom_value"
+  assert kwargs["extra_body"]["priority"] == "high"
+
+
+def _split_into_chunks(text, sizes):
+  pieces = []
+  pos = 0
+  for size in sizes:
+    pieces.append(text[pos : pos + size])
+    pos += size
+  if pos < len(text):
+    pieces.append(text[pos:])
+  return pieces
+
+
+def test_brace_depth_tracker_simple_object():
+  tracker = _BraceDepthTracker()
+  assert tracker.feed('{"a": 1}') is True
+
+
+def test_brace_depth_tracker_empty_object():
+  tracker = _BraceDepthTracker()
+  assert tracker.feed("{}") is True
+
+
+def test_brace_depth_tracker_only_opens():
+  tracker = _BraceDepthTracker()
+  assert tracker.feed('{"a": ') is False
+
+
+def test_brace_depth_tracker_completes_after_more_fragments():
+  tracker = _BraceDepthTracker()
+  assert tracker.feed('{"a": ') is False
+  assert tracker.feed('"b"') is False
+  assert tracker.feed("}") is True
+
+
+def test_brace_depth_tracker_nested_objects():
+  tracker = _BraceDepthTracker()
+  assert tracker.feed('{"a": {"b": {"c": 1}}}') is True
+
+
+def test_brace_depth_tracker_nested_split_across_fragments():
+  tracker = _BraceDepthTracker()
+  fragments = _split_into_chunks(
+      '{"a": {"b": {"c": 1}, "d": [1, 2, 3]}, "e": "f"}', [3, 5, 4, 7, 9, 2, 1]
+  )
+  closes = [tracker.feed(f) for f in fragments]
+  assert sum(closes) == 1
+  assert closes[-1] is True
+
+
+def test_brace_depth_tracker_string_with_braces_ignored():
+  tracker = _BraceDepthTracker()
+  # Braces inside strings must not affect depth.
+  assert tracker.feed('{"x": "{}{{}}"}') is True
+
+
+def test_brace_depth_tracker_string_with_braces_split_across_fragments():
+  tracker = _BraceDepthTracker()
+  fragments = ['{"x": "', "abc{def", "}ghi", '"}']
+  closes = [tracker.feed(f) for f in fragments]
+  assert closes == [False, False, False, True]
+
+
+def test_brace_depth_tracker_escaped_quote_in_string():
+  tracker = _BraceDepthTracker()
+  # Escaped quote should not end the string; the trailing } closes the obj.
+  assert tracker.feed(r'{"x": "a\"b}c"}') is True
+
+
+def test_brace_depth_tracker_escaped_backslash_then_quote_ends_string():
+  tracker = _BraceDepthTracker()
+  # \\ is an escaped backslash; the next " ends the string. Then } closes.
+  assert tracker.feed(r'{"x": "a\\"}') is True
+
+
+def test_brace_depth_tracker_escape_split_across_fragments():
+  tracker = _BraceDepthTracker()
+  # Backslash arrives in one fragment, the escaped quote in the next.
+  fragments = ['{"x": "a', "\\", '"', 'b"}']
+  closes = [tracker.feed(f) for f in fragments]
+  assert closes == [False, False, False, True]
+
+
+def test_brace_depth_tracker_two_consecutive_objects():
+  tracker = _BraceDepthTracker()
+  assert tracker.feed('{"a": 1}{"b": 2}') is True
+
+
+def test_brace_depth_tracker_one_char_at_a_time():
+  tracker = _BraceDepthTracker()
+  text = '{"key": {"nested": "v{}al"}, "n": 42}'
+  closes = [tracker.feed(ch) for ch in text]
+  assert sum(closes) == 1
+  assert closes[-1] is True
+
+
+def test_brace_depth_tracker_leading_whitespace_ignored():
+  tracker = _BraceDepthTracker()
+  assert tracker.feed('   \n  {"a": 1}') is True
+
+
+def _function_chunks_for_args(arg_fragments):
+  return [
+      FunctionChunk(
+          id="call_xyz" if i == 0 else None,
+          name="my_func" if i == 0 else None,
+          args=fragment,
+          index=0,
+      )
+      for i, fragment in enumerate(arg_fragments)
+  ]
+
+
+def _stream_chunks_from_function_chunks(function_chunks):
+  stream = []
+  for chunk in function_chunks:
+    delta_kwargs = {"role": "assistant"}
+    if chunk.args is not None:
+      delta_kwargs["tool_calls"] = [
+          ChatCompletionDeltaToolCall(
+              type="function",
+              id=chunk.id,
+              function=Function(name=chunk.name, arguments=chunk.args),
+              index=chunk.index,
+          )
+      ]
+    stream.append(
+        ModelResponseStream(
+            choices=[
+                StreamingChoices(
+                    finish_reason=None, delta=Delta(**delta_kwargs)
+                )
+            ]
+        )
+    )
+  stream.append(
+      ModelResponseStream(
+          choices=[StreamingChoices(finish_reason="tool_calls", delta=Delta())]
+      )
+  )
+  return stream
+
+
+@pytest.mark.asyncio
+async def test_streaming_tool_call_args_assembled_from_many_fragments(
+    mock_completion, lite_llm_instance
+):
+  full_args = (
+      '{"city": "San Francisco", "details": {"radius": 5, "tags": ["a{}",'
+      ' "b\\"c"]}}'
+  )
+  fragments = _split_into_chunks(full_args, [4, 6, 1, 8, 3, 11, 2, 9, 7, 5, 1])
+  mock_completion.return_value = iter(
+      _stream_chunks_from_function_chunks(_function_chunks_for_args(fragments))
+  )
+
+  responses = [
+      r
+      async for r in lite_llm_instance.generate_content_async(
+          LLM_REQUEST_WITH_FUNCTION_DECLARATION, stream=True
+      )
+  ]
+
+  assert len(responses) == 1
+  function_call = responses[0].content.parts[0].function_call
+  assert function_call.name == "my_func"
+  assert function_call.id == "call_xyz"
+  assert function_call.args == json.loads(full_args)
+
+
+async def _count_full_buffer_loads(
+    lite_llm_instance, mock_completion, full_args, fragments
+):
+  mock_completion.return_value = iter(
+      _stream_chunks_from_function_chunks(_function_chunks_for_args(fragments))
+  )
+  real_loads = json.loads
+  with patch(
+      "google.adk.models.lite_llm.json.loads", side_effect=real_loads
+  ) as patched_loads:
+    responses = [
+        r
+        async for r in lite_llm_instance.generate_content_async(
+            LLM_REQUEST_WITH_FUNCTION_DECLARATION, stream=True
+        )
+    ]
+  full_buffer_calls = [
+      c
+      for c in patched_loads.call_args_list
+      if c.args and c.args[0] == full_args
+  ]
+  return responses, len(full_buffer_calls)
+
+
+@pytest.mark.asyncio
+async def test_streaming_tool_call_json_loads_count_independent_of_fragment_count(
+    mock_completion, lite_llm_instance
+):
+  # The previous implementation called json.loads(buffer) after every
+  # fragment, so the count grew with the fragment count (O(N) calls and
+  # O(N^2) total parse cost). The fix makes the count constant.
+  full_args = '{"a": 1, "b": {"c": 2}}'
+  one_chunk = [full_args]
+  one_char_at_a_time = _split_into_chunks(full_args, [1] * len(full_args))
+
+  _, count_one_chunk = await _count_full_buffer_loads(
+      lite_llm_instance, mock_completion, full_args, one_chunk
+  )
+  _, count_many_chunks = await _count_full_buffer_loads(
+      lite_llm_instance, mock_completion, full_args, one_char_at_a_time
+  )
+  assert count_one_chunk == count_many_chunks
+
+
+@pytest.mark.asyncio
+async def test_streaming_tool_call_brace_in_string_does_not_falsely_complete(
+    mock_completion, lite_llm_instance
+):
+  # The closing brace inside the string must not advance fallback_index.
+  # If it did, the second tool call would be merged into a single bucket
+  # and the assembled args would be invalid.
+  full_args_a = '{"text": "a{b}c"}'
+  full_args_b = '{"x": 1}'
+  fragments_a = _split_into_chunks(full_args_a, [1] * len(full_args_a))
+  fragments_b = _split_into_chunks(full_args_b, [1] * len(full_args_b))
+
+  function_chunks = _function_chunks_for_args(fragments_a)
+  # Second tool call: provider emits no index, relies on fallback_index advance.
+  for i, fragment in enumerate(fragments_b):
+    function_chunks.append(
+        FunctionChunk(
+            id="call_2" if i == 0 else None,
+            name="other_func" if i == 0 else None,
+            args=fragment,
+            index=0,
+        )
+    )
+
+  mock_completion.return_value = iter(
+      _stream_chunks_from_function_chunks(function_chunks)
+  )
+
+  responses = [
+      r
+      async for r in lite_llm_instance.generate_content_async(
+          LLM_REQUEST_WITH_FUNCTION_DECLARATION, stream=True
+      )
+  ]
+
+  assert len(responses) == 1
+  parts = responses[0].content.parts
+  assert len(parts) == 2
+  args_by_name = {p.function_call.name: p.function_call.args for p in parts}
+  assert args_by_name["my_func"] == json.loads(full_args_a)
+  assert args_by_name["other_func"] == json.loads(full_args_b)

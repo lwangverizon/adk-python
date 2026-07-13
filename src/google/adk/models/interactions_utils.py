@@ -60,6 +60,7 @@ from google.genai.interactions import InteractionCompletedEvent
 from google.genai.interactions import InteractionCreatedEvent
 from google.genai.interactions import InteractionSSEEvent
 from google.genai.interactions import InteractionStatusUpdate
+from google.genai.interactions import MCPServerParam
 from google.genai.interactions import ModelOutputStep
 from google.genai.interactions import ModelOutputStepParam
 from google.genai.interactions import Step
@@ -81,6 +82,9 @@ from typing_extensions import deprecated
 if TYPE_CHECKING:
   from google.genai import Client
 
+  from ..tools._remote_mcp_server import RemoteMcpServer
+
+from ..utils._google_client_headers import merge_tracking_headers
 from .llm_request import LlmRequest
 from .llm_response import LlmResponse
 
@@ -112,6 +116,29 @@ def _extract_stream_interaction_id(
   return None
 
 
+def _extract_stream_environment_id(
+    event: InteractionSSEEvent,
+) -> str | None:
+  """Extract the environment id from an Interactions SSE event, if present.
+
+  The non-streaming ``Interaction`` declares an ``environment_id`` field. On
+  streaming SSE events the id is read opportunistically from the carried
+  interaction (created/completed events allow extra fields), so it is returned
+  only when the API actually includes it and is ``None`` otherwise.
+  """
+  interaction = None
+  if isinstance(event, (InteractionCreatedEvent, InteractionCompletedEvent)):
+    interaction = event.interaction
+  elif isinstance(event, Interaction):
+    interaction = event
+
+  if interaction is None:
+    return None
+
+  env_id = getattr(interaction, 'environment_id', None)
+  return env_id if isinstance(env_id, str) else None
+
+
 def _encode_base64_string(data: bytes) -> str:
   """Encode bytes to a base64 string."""
   return base64.b64encode(data).decode('utf-8')
@@ -130,7 +157,9 @@ def _wrap_content_param_in_step(
     'convert_part_to_interaction_content is deprecated and will be removed in'
     ' future versions'
 )
-def convert_part_to_interaction_content(part: types.Part) -> dict | None:
+def convert_part_to_interaction_content(
+    part: types.Part,
+) -> dict[str, Any] | None:
   """Convert a types.Part to an interaction content dict.
 
   Args:
@@ -228,12 +257,12 @@ def convert_part_to_interaction_content(part: types.Part) -> dict | None:
   elif part.thought:
     # part.thought is a boolean indicating this is a thought part
     # ThoughtContentParam expects 'signature' (base64 encoded bytes)
-    result: dict[str, Any] = {'type': 'thought'}
+    thought_result: dict[str, Any] = {'type': 'thought'}
     if part.thought_signature is not None:
-      result['signature'] = base64.b64encode(part.thought_signature).decode(
-          'utf-8'
-      )
-    return result
+      thought_result['signature'] = base64.b64encode(
+          part.thought_signature
+      ).decode('utf-8')
+    return thought_result
   elif part.code_execution_result is not None:
     is_error = part.code_execution_result.outcome in (
         types.Outcome.OUTCOME_FAILED,
@@ -496,6 +525,27 @@ def convert_tools_config_to_interactions_format(
       interaction_tools.append({'type': 'computer_use'})
 
   return interaction_tools
+
+
+def _build_mcp_server_param(
+    server: RemoteMcpServer,
+    resolved_headers: dict[str, str],
+) -> MCPServerParam:
+  """Map a RemoteMcpServer + resolved headers to an interactions MCPServerParam.
+
+  Built directly (not via ``types.McpServer``) so ``allowed_tools`` can be
+  carried and the "not supported in Vertex AI" restriction on
+  ``types.Tool.mcp_servers`` is avoided. ``resolved_headers`` is the static
+  headers already merged with any ``header_provider`` output by the caller.
+  """
+  param: MCPServerParam = {'type': 'mcp_server', 'url': server.url}
+  if server.name is not None:
+    param['name'] = server.name
+  if resolved_headers:
+    param['headers'] = resolved_headers
+  if server.allowed_tools is not None:
+    param['allowed_tools'] = [{'tools': list(server.allowed_tools)}]
+  return param
 
 
 def _function_result_to_response(
@@ -1428,6 +1478,7 @@ async def _create_interactions(
     *,
     create_kwargs: dict[str, Any],
     stream: bool,
+    extra_headers: dict[str, str] | None = None,
 ) -> AsyncGenerator[LlmResponse, None]:
   """Issue ``interactions.create`` and convert the response(s) to LlmResponses.
 
@@ -1438,17 +1489,22 @@ async def _create_interactions(
   Args:
     api_client: The Google GenAI client.
     create_kwargs: Keyword arguments passed verbatim to
-      ``api_client.aio.interactions.create`` (excluding ``stream``).
+      ``api_client.aio.interactions.create`` (excluding ``stream`` and
+      ``extra_headers``).
     stream: Whether to stream the response.
+    extra_headers: Optional per-request HTTP headers forwarded to
+      ``interactions.create`` (e.g. ADK tracking headers merged with any
+      user-supplied headers). ``None`` sends no extra headers.
 
   Yields:
     LlmResponse objects converted from interaction responses.
   """
   current_interaction_id: str | None = None
+  current_environment_id: str | None = None
 
   if stream:
     responses = await api_client.aio.interactions.create(
-        **create_kwargs, stream=True
+        **create_kwargs, stream=True, extra_headers=extra_headers
     )
     state = _StreamState()
     async for event in responses:
@@ -1456,18 +1512,24 @@ async def _create_interactions(
       interaction_id = _extract_stream_interaction_id(event)
       if interaction_id:
         current_interaction_id = interaction_id
+      environment_id = _extract_stream_environment_id(event)
+      if environment_id:
+        current_environment_id = environment_id
       llm_response = convert_interaction_event_to_llm_response(
           event, state, current_interaction_id
       )
       if llm_response:
+        llm_response.environment_id = current_environment_id
         yield llm_response
   else:
     interaction = await api_client.aio.interactions.create(
-        **create_kwargs, stream=False
+        **create_kwargs, stream=False, extra_headers=extra_headers
     )
     logger.info('Interaction response received.')
     logger.debug(build_interactions_response_log(interaction))
-    yield convert_interaction_to_llm_response(interaction)
+    llm_response = convert_interaction_to_llm_response(interaction)
+    llm_response.environment_id = interaction.environment_id
+    yield llm_response
 
 
 async def generate_content_via_interactions(
@@ -1542,7 +1604,17 @@ async def generate_content_via_interactions(
       'previous_interaction_id': previous_interaction_id,
   }
 
+  # Re-merge tracking headers into any request-time headers (idempotent) so the
+  # interactions path forwards user-supplied headers instead of dropping them.
+  config_headers = None
+  if llm_request.config and llm_request.config.http_options:
+    config_headers = llm_request.config.http_options.headers
+  extra_headers = merge_tracking_headers(config_headers)
+
   async for llm_response in _create_interactions(
-      api_client, create_kwargs=create_kwargs, stream=stream
+      api_client,
+      create_kwargs=create_kwargs,
+      stream=stream,
+      extra_headers=extra_headers,
   ):
     yield llm_response

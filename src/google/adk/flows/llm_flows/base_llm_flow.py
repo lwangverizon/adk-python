@@ -71,6 +71,11 @@ logger = logging.getLogger('google_adk.' + __name__)
 
 _ADK_AGENT_NAME_LABEL_KEY = 'adk_agent_name'
 
+_NO_CONTENT_ERROR_CODE = 'MODEL_RETURNED_NO_CONTENT'
+_NO_CONTENT_ERROR_MESSAGE = (
+    'The model returned no content (finish_reason=STOP with empty parts).'
+)
+
 # Timing configuration
 DEFAULT_TRANSFER_AGENT_DELAY = 1.0
 DEFAULT_TASK_COMPLETION_DELAY = 1.0
@@ -264,7 +269,7 @@ async def _handle_after_model_callback(
   agent = invocation_context.agent
 
   # Add grounding metadata to the response if needed.
-  # TODO(b/448114567): Remove this function once the workaround is no longer needed.
+  # TODO: Remove this function once the workaround is no longer needed.
   async def _maybe_add_grounding_metadata(
       response: Optional[LlmResponse] = None,
   ) -> Optional[LlmResponse]:
@@ -514,7 +519,7 @@ class BaseLlmFlow(ABC):
   This flow ends when it transfers to another agent.
   """
 
-  def __init__(self):
+  def __init__(self) -> None:
     self.request_processors: list[BaseLlmRequestProcessor] = []
     self.response_processors: list[BaseLlmResponseProcessor] = []
 
@@ -763,7 +768,7 @@ class BaseLlmFlow(ABC):
       self,
       llm_connection: BaseLlmConnection,
       invocation_context: InvocationContext,
-  ):
+  ) -> None:
     """Sends data to model."""
     while True:
       live_request_queue = invocation_context.live_request_queue
@@ -801,14 +806,16 @@ class BaseLlmFlow(ABC):
 
       if live_request.content:
         content = live_request.content
+        if content.parts and any(p.function_call for p in content.parts):
+          raise ValueError('User message cannot contain function calls.')
         # Persist user text content to session (similar to non-live mode)
         # Skip function responses - they are already handled separately
         is_function_response = content.parts and any(
             part.function_response for part in content.parts
         )
-        if not is_function_response:
-          if not content.role:
-            content.role = 'user'
+        if not is_function_response and not content.role:
+          content.role = 'user'
+        if not is_function_response and not live_request.partial:
           user_content_event = Event(
               id=Event.new_id(),
               invocation_id=invocation_context.invocation_id,
@@ -819,7 +826,9 @@ class BaseLlmFlow(ABC):
               session=invocation_context.session,
               event=user_content_event,
           )
-        await llm_connection.send_content(live_request.content)
+        await llm_connection._send_content(
+            live_request.content, partial=live_request.partial
+        )
 
   async def _receive_from_model(
       self,
@@ -1018,6 +1027,15 @@ class BaseLlmFlow(ABC):
           f' but got {type(agent)}'
       )
 
+    # Request defaults; _BasicLlmRequestProcessor merges them onto agent config.
+    if (
+        invocation_context.run_config
+        and invocation_context.run_config.http_options
+    ):
+      llm_request.config.http_options = (
+          invocation_context.run_config.http_options.model_copy(deep=True)
+      )
+
     # Runs processors.
     for processor in self.request_processors:
       async with Aclosing(
@@ -1065,6 +1083,23 @@ class BaseLlmFlow(ABC):
     ) as agen:
       async for event in agen:
         yield event
+
+    # A non-streaming turn that finishes with STOP but has no content parts would
+    # otherwise be skipped below and become a silent empty final response;
+    # surface it as an actionable error instead. Streaming is excluded
+    # because a terminal finish-only chunk legitimately follows content already
+    # streamed in earlier chunks.
+    if (
+        not llm_response.partial
+        and llm_response.error_code is None
+        and llm_response.finish_reason == types.FinishReason.STOP
+        and (not llm_response.content or not llm_response.content.parts)
+        and invocation_context.run_config.streaming_mode != StreamingMode.SSE
+    ):
+      llm_response.error_code = _NO_CONTENT_ERROR_CODE
+      llm_response.error_message = (
+          llm_response.error_message or _NO_CONTENT_ERROR_MESSAGE
+      )
 
     # Skip the model response event if there is no content and no error code.
     # This is needed for the code executor to trigger another loop.
@@ -1138,6 +1173,7 @@ class BaseLlmFlow(ABC):
         and not llm_response.usage_metadata
         and not llm_response.live_session_resumption_update
         and not llm_response.grounding_metadata
+        and not llm_response.voice_activity
     ):
       return
 
@@ -1146,6 +1182,12 @@ class BaseLlmFlow(ABC):
       model_response_event.live_session_resumption_update = (
           llm_response.live_session_resumption_update
       )
+      yield model_response_event
+      return
+
+    # Handle voice activity events
+    if llm_response.voice_activity:
+      model_response_event.voice_activity = llm_response.voice_activity
       yield model_response_event
       return
 
@@ -1190,23 +1232,28 @@ class BaseLlmFlow(ABC):
 
     # Handles function calls.
     if model_response_event.get_function_calls():
-      function_response_event = await functions.handle_function_calls_live(
+      # handle_function_calls_live returns None when every call is deferred
+      # (e.g. all long-running), so guard before yielding to avoid emitting a
+      # None event into the live stream.
+      if function_response_event := await functions.handle_function_calls_live(
           invocation_context, model_response_event, llm_request.tools_dict
-      )
-      # Always yield the function response event first
-      yield function_response_event
-
-      # Check if this is a set_model_response function response
-      if json_response := _output_schema_processor.get_structured_model_response(
-          function_response_event
       ):
-        # Create and yield a final model response event
-        final_event = (
-            _output_schema_processor.create_final_model_response_event(
-                invocation_context, json_response
+        # Always yield the function response event first
+        yield function_response_event
+
+        # Check if this is a set_model_response function response
+        if json_response := (
+            _output_schema_processor.get_structured_model_response(
+                function_response_event
             )
-        )
-        yield final_event
+        ):
+          # Create and yield a final model response event
+          final_event = (
+              _output_schema_processor.create_final_model_response_event(
+                  invocation_context, json_response
+              )
+          )
+          yield final_event
 
   async def _postprocess_run_processors_async(
       self, invocation_context: InvocationContext, llm_response: LlmResponse
