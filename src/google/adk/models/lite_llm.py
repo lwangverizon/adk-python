@@ -27,7 +27,6 @@ import re
 import sys
 from typing import Any
 from typing import AsyncGenerator
-from typing import cast
 from typing import Dict
 from typing import Generator
 from typing import Iterable
@@ -54,6 +53,7 @@ from pydantic import Field
 from typing_extensions import override
 
 from ..utils._google_client_headers import merge_tracking_headers
+from ._capabilities import LlmCapabilities
 from .base_llm import BaseLlm
 from .llm_request import LlmRequest
 from .llm_response import LlmResponse
@@ -626,6 +626,26 @@ def _extract_reasoning_value(message: Message | Delta | None) -> Any:
   return message.get("reasoning")
 
 
+_GEMMA4_MODEL_PATTERN = re.compile(r"gemma-?4")
+
+
+def _is_gemma4_model(model: str) -> bool:
+  """Detects Gemma 4 models across naming conventions.
+
+  Ollama uses "gemma4" (e.g. "ollama/gemma4:e2b"), while Hugging Face,
+  vLLM, and llama.cpp use the hyphenated "gemma-4" (e.g.
+  "google/gemma-4-26B-A4B"). Both need role='tool_responses' for tool
+  results.
+
+  Args:
+    model: The model name to check.
+
+  Returns:
+    True if the model is a Gemma 4 model, False otherwise.
+  """
+  return bool(_GEMMA4_MODEL_PATTERN.search(model.lower()))
+
+
 class ChatCompletionFileUrlObject(TypedDict, total=False):
   file_data: str
   file_id: str
@@ -1006,7 +1026,7 @@ async def _content_to_message_param(
       # from the tool call, instead of OpenAI-compatible 'tool' role used by other models.
       # Earlier Gemma versions before version 4 do not support tool use,
       # so this check is intentionally scoped to only look for "gemma4" in the model name.
-      tool_role = "tool_responses" if "gemma4" in model.lower() else "tool"
+      tool_role = "tool_responses" if _is_gemma4_model(model) else "tool"
       tool_messages.append(
           ChatCompletionToolMessage(
               role=tool_role,
@@ -1174,7 +1194,7 @@ def _ensure_tool_results(messages: List[Message], model: str) -> List[Message]:
 
   healed_messages: List[Message] = []
   pending_tool_call_ids: List[str] = []
-  expected_tool_role = "tool_responses" if "gemma4" in model.lower() else "tool"
+  expected_tool_role = "tool_responses" if _is_gemma4_model(model) else "tool"
 
   for message in messages:
     role = message.get("role")
@@ -1309,7 +1329,7 @@ async def _get_content(
           )
           content_objects.append({
               "type": "file",
-              "file": {"file_id": file_response.id},
+              "file": {"file_id": file_response.id, "format": mime_type},
           })
         else:
           content_objects.append({
@@ -2317,6 +2337,7 @@ async def _get_completion_inputs(
     Optional[List[Dict[str, Any]]],
     Optional[Dict[str, Any]],
     Optional[Dict[str, Any]],
+    str | None,
 ]:
   """Converts an LlmRequest to litellm inputs and extracts generation params.
 
@@ -2325,8 +2346,8 @@ async def _get_completion_inputs(
     model: The model string to use for determining provider-specific behavior.
 
   Returns:
-    The litellm inputs (message list, tool dictionary, response format and
-    generation params).
+    The litellm inputs (message list, tool dictionary, response format,
+    generation params, and tool_choice).
   """
   _ensure_litellm_imported()
 
@@ -2356,15 +2377,24 @@ async def _get_completion_inputs(
 
   # 2. Convert tool declarations
   tools: Optional[List[Dict[str, Any]]] = None
-  if (
-      llm_request.config
-      and llm_request.config.tools
-      and llm_request.config.tools[0].function_declarations
-  ):
-    tools = [
-        _function_declaration_to_tool_param(tool)
-        for tool in llm_request.config.tools[0].function_declarations
-    ]
+  if llm_request.config and llm_request.config.tools:
+    tools = []
+    for tool in llm_request.config.tools:
+      if not isinstance(tool, types.Tool):
+        continue
+      if tool.function_declarations:
+        tools.extend(
+            _function_declaration_to_tool_param(func_decl)
+            for func_decl in tool.function_declarations
+        )
+      else:
+        # Native/built-in tools (e.g. google_search) carry no
+        # function_declarations; serialize them as-is so they reach the
+        # provider or proxy instead of being silently dropped.
+        dumped_tool = tool.model_dump(by_alias=True, exclude_none=True)
+        if dumped_tool:
+          tools.append(dumped_tool)
+    tools = tools or None
 
   # 3. Handle response format
   response_format: dict[str, Any] | None = None
@@ -2401,7 +2431,26 @@ async def _get_completion_inputs(
     if not generation_params:
       generation_params = None
 
-  return messages, tools, response_format, generation_params
+  # 5. Extract tool_choice from tool_config
+  tool_choice: Optional[str] = None
+  if (
+      llm_request.config
+      and llm_request.config.tool_config
+      and llm_request.config.tool_config.function_calling_config
+  ):
+    mode = llm_request.config.tool_config.function_calling_config.mode
+    if mode == types.FunctionCallingConfigMode.ANY:
+      tool_choice = "required"
+    elif mode == types.FunctionCallingConfigMode.NONE:
+      tool_choice = "none"
+    # AUTO → None (provider default)
+
+  # Coerce tool_choice to None when there are no tools to choose from.
+  # LiteLLM rejects tool_choice="required" (or "none") when tools is falsy.
+  if not tools:
+    tool_choice = None
+
+  return messages, tools, response_format, generation_params, tool_choice
 
 
 def _build_function_declaration_log(
@@ -2438,10 +2487,12 @@ def _build_request_log(req: LlmRequest) -> str:
     The request log.
   """
 
-  function_decls: list[types.FunctionDeclaration] = cast(
-      list[types.FunctionDeclaration],
-      req.config.tools[0].function_declarations if req.config.tools else [],
-  )
+  function_decls: list[types.FunctionDeclaration] = [
+      func_decl
+      for tool in req.config.tools or []
+      if isinstance(tool, types.Tool) and tool.function_declarations
+      for func_decl in tool.function_declarations
+  ]
   function_logs = (
       [
           _build_function_declaration_log(func_decl)
@@ -2659,7 +2710,9 @@ class LiteLlm(BaseLlm):
     llm_client: The LLM client to use for the model.
   """
 
-  llm_client: LiteLLMClient = Field(default_factory=LiteLLMClient)
+  # LiteLLMClient has no JSON serializer, so it is excluded from dumps to keep
+  # model_dump(mode="json") from raising.
+  llm_client: LiteLLMClient = Field(default_factory=LiteLLMClient, exclude=True)
   """The LLM client to use for the model."""
 
   _additional_args: Dict[str, Any] = None
@@ -2686,6 +2739,14 @@ class LiteLlm(BaseLlm):
     if drop_params is not None:
       self._additional_args["drop_params"] = drop_params
 
+  @property
+  @override
+  def capabilities(self) -> LlmCapabilities:
+    # LiteLLM reconciles tools + response_format per provider: providers with
+    # native support get both passed through, and the rest are converted to a
+    # json tool call with tool_choice enforcement.
+    return LlmCapabilities(output_schema_and_tools=True)
+
   async def generate_content_async(
       self, llm_request: LlmRequest, stream: bool = False
   ) -> AsyncGenerator[LlmResponse, None]:
@@ -2706,7 +2767,7 @@ class LiteLlm(BaseLlm):
       logger.debug(_build_request_log(llm_request))
 
     effective_model = llm_request.model or self.model
-    messages, tools, response_format, generation_params = (
+    messages, tools, response_format, generation_params, tool_choice = (
         await _get_completion_inputs(llm_request, effective_model)
     )
     normalized_messages = _normalize_ollama_chat_messages(
@@ -2718,6 +2779,8 @@ class LiteLlm(BaseLlm):
     if "functions" in self._additional_args:
       # LiteLLM does not support both tools and functions together.
       tools = None
+      # No tools -> a "required"/"none" tool_choice would be rejected.
+      tool_choice = None
 
     completion_args: dict[str, Any] = {
         "model": effective_model,
@@ -2737,6 +2800,9 @@ class LiteLlm(BaseLlm):
 
     if generation_params:
       completion_args.update(generation_params)
+
+    if tool_choice is not None:
+      completion_args["tool_choice"] = tool_choice
 
     if llm_request.config.http_options:
       http_opts = llm_request.config.http_options
@@ -2763,12 +2829,15 @@ class LiteLlm(BaseLlm):
         completion_args["extra_body"] = http_opts.extra_body
 
     if stream:
-      text = ""
+      # Accumulate into lists and join once: `+=` on a closure cell or a dict
+      # item does not get CPython's in-place unicode concat, so it would copy
+      # the whole buffer on every streamed chunk.
+      text_parts: list[str] = []
       reasoning_parts: List[types.Part] = []
       # Track function calls by index
       function_calls: dict[int, dict[str, Any]] = (
           {}
-      )  # index -> {name, args, id}
+      )  # index -> {name, args_parts, id}
       tool_call_trackers: Dict[int, _BraceDepthTracker] = {}
       completion_args["stream"] = True
       completion_args["stream_options"] = {"include_usage": True}
@@ -2785,9 +2854,10 @@ class LiteLlm(BaseLlm):
         has_incomplete_tool_call_args = False
         for index, func_data in function_calls.items():
           if func_data["id"]:
+            args = "".join(func_data["args_parts"])
             if finish_reason == "length":
               try:
-                _parse_tool_call_arguments(func_data["args"])
+                _parse_tool_call_arguments(args)
               except json.JSONDecodeError:
                 has_incomplete_tool_call_args = True
                 continue
@@ -2797,7 +2867,7 @@ class LiteLlm(BaseLlm):
                     id=func_data["id"],
                     function=Function(
                         name=func_data["name"],
-                        arguments=func_data["args"],
+                        arguments=args,
                         index=index,
                     ),
                 )
@@ -2818,7 +2888,7 @@ class LiteLlm(BaseLlm):
         llm_response = _message_to_generate_content_response(
             ChatCompletionAssistantMessage(
                 role="assistant",
-                content=text,
+                content="".join(text_parts),
                 tool_calls=tool_calls,
             ),
             model_version=model_version,
@@ -2836,7 +2906,7 @@ class LiteLlm(BaseLlm):
       def _finalize_text_response(
           *, model_version: str, finish_reason: str
       ) -> LlmResponse:
-        message_content = text if text else None
+        message_content = "".join(text_parts) or None
         llm_response = _message_to_generate_content_response(
             ChatCompletionAssistantMessage(
                 role="assistant",
@@ -2855,8 +2925,8 @@ class LiteLlm(BaseLlm):
         return llm_response
 
       def _reset_stream_buffers() -> None:
-        nonlocal text, reasoning_parts
-        text = ""
+        nonlocal reasoning_parts
+        text_parts.clear()
         reasoning_parts = []
         function_calls.clear()
         tool_call_trackers.clear()
@@ -2871,12 +2941,13 @@ class LiteLlm(BaseLlm):
           if isinstance(chunk, FunctionChunk):
             index = chunk.index or fallback_index
             if index not in function_calls:
-              function_calls[index] = {"name": "", "args": "", "id": None}
+              function_calls[index] = {"name": "", "args_parts": [], "id": None}
 
             if chunk.name:
               function_calls[index]["name"] += chunk.name
             if chunk.args:
-              function_calls[index]["args"] += chunk.args
+              args_parts = function_calls[index]["args_parts"]
+              args_parts.append(chunk.args)
 
               # Detect args completion to advance fallback_index (workaround
               # for improper chunk indexing) without O(N^2) re-parsing.
@@ -2885,7 +2956,7 @@ class LiteLlm(BaseLlm):
               )
               if tracker.feed(chunk.args):
                 try:
-                  json.loads(function_calls[index]["args"])
+                  json.loads("".join(args_parts))
                   fallback_index += 1
                 except json.JSONDecodeError:
                   pass
@@ -2894,7 +2965,8 @@ class LiteLlm(BaseLlm):
                 chunk.id or function_calls[index]["id"] or str(index)
             )
           elif isinstance(chunk, TextChunk):
-            text += chunk.text
+            if chunk.text:
+              text_parts.append(chunk.text)
             yield _message_to_generate_content_response(
                 ChatCompletionAssistantMessage(
                     role="assistant",
@@ -2937,7 +3009,7 @@ class LiteLlm(BaseLlm):
                 )
             )
             _reset_stream_buffers()
-          elif (text or reasoning_parts) and (
+          elif (text_parts or reasoning_parts) and (
               finish_reason == "length"
               or (
                   finish_reason == "stop"
@@ -2958,7 +3030,7 @@ class LiteLlm(BaseLlm):
         )
         _reset_stream_buffers()
 
-      if (text or reasoning_parts) and not aggregated_llm_response:
+      if (text_parts or reasoning_parts) and not aggregated_llm_response:
         aggregated_llm_response = _finalize_text_response(
             model_version=part.model,
             finish_reason="stop",

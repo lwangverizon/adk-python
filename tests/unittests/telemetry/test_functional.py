@@ -66,7 +66,18 @@ async def test_telemetry_schema(
   metric_reader = InMemoryMetricReader()
   install_telemetry(monkeypatch, span_exporter, log_exporter, metric_reader)
 
-  await run_agent_scenario(build_test_runner())
+  if case.model_exception is not None:
+    # The mock raises before responding; the scenario must propagate it.
+    with pytest.raises(Exception):  # noqa: B017 -- exact type varies per case.
+      await run_agent_scenario(
+          build_test_runner(model_exception=case.model_exception)
+      )
+  elif case.tool_fails:
+    # The tool raises while the model is fine; the scenario must propagate it.
+    with pytest.raises(ValueError, match="This tool always fails"):
+      await run_agent_scenario(build_test_runner(failing=True))
+  else:
+    await run_agent_scenario(build_test_runner())
 
   digest = TelemetryDigest.build(
       span_exporter.get_finished_spans(),
@@ -173,6 +184,26 @@ def test_instrumented_with_opentelemetry_instrumentation_google_genai():
   assert (
       not tracing._instrumented_with_opentelemetry_instrumentation_google_genai()
   )
+
+
+def test_instrumented_detection_normalizes_windows_path_separators(
+    monkeypatch: pytest.MonkeyPatch,
+):
+  """Backslash-separated instrumentation paths are matched on Windows."""
+  windows_path = r"C:\pkg\opentelemetry\instrumentation\google_genai\patch.py"
+
+  class _FakeCode:
+    co_filename = windows_path
+
+  class _FakeInstrumentedFunction:
+    __code__ = _FakeCode
+    __wrapped__ = object()
+
+  monkeypatch.setattr(
+      tracing.Models, "generate_content", _FakeInstrumentedFunction
+  )
+
+  assert tracing._instrumented_with_opentelemetry_instrumentation_google_genai()
 
 
 # ---------------------------------------------------------------------------

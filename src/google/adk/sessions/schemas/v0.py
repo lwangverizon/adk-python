@@ -20,8 +20,7 @@ v0 schema, see
 https://github.com/google/adk-python/blob/main/docs/upgrading_from_1_22_0.md.
 
 The latest schema is defined in `v1.py`. That module uses JSON serialization
-for the EventActions data as well as other fields in the `events` table. See
-https://github.com/google/adk-python/discussions/3605 for more details.
+for the EventActions data as well as other fields in the `events` table.
 """
 
 from __future__ import annotations
@@ -93,6 +92,9 @@ class DynamicPickleType(TypeDecorator):
   """Represents a type that can be pickled."""
 
   impl = PickleType
+  # Behavior depends only on the dialect, which the compiled cache already
+  # keys on, so statements using this type are safe to cache.
+  cache_ok = True
 
   def load_dialect_impl(self, dialect):
     if dialect.name == "mysql":

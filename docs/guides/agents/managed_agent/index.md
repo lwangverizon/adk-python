@@ -97,6 +97,37 @@ root_agent = LlmAgent(
 )
 ```
 
+## Create and use a custom managed agent
+
+`ManagedAgent` connects to an existing managed agent by `agent_id`. You can
+shape that agent's behavior inline, with no resource creation: set
+[`instruction`](#system-instruction) for a persona and pass server-side `tools`
+such as `google_search` (see [Get started](#get-started)).
+
+Create a **custom managed-agent resource** when you instead want a persistent,
+named agent whose persona and server-side tools are baked into the resource and
+reusable by id across apps and sessions. Create it through the control plane,
+then point `ManagedAgent` at its id. The genai client `ManagedAgent` already
+holds (`managed_search_agent.api_client`) exposes both planes: interactions
+(data plane) and `agents.create` / `agents.delete` (control plane), so you can
+create with the same client:
+
+```python
+created = managed_search_agent.api_client.agents.create(
+    id='adk-custom-search-agent',
+    base_agent='antigravity-preview-05-2026',
+    system_instruction='You are a concise research assistant. ...',
+    tools=[{'type': 'google_search'}],
+)
+# created.id is the agent id ManagedAgent(agent_id=...) connects to.
+```
+
+Creating a custom agent requires the GEAP/Vertex backend (`global` location);
+its `system_instruction` and tools are fixed at create time, and creation is
+asynchronous (the agent takes a short while to become ready). See the
+[custom_agent sample](../../../../contributing/samples/managed_agent/custom_agent)
+for a runnable example with `--create` / `--delete` flags.
+
 ## How it works
 
 The `ManagedAgent` implements the `BaseAgent` contract but bypasses standard
@@ -124,6 +155,28 @@ the local session — is the source of truth for continuing a conversation.
 Response text appears in both places (the local ADK events and the remote
 interaction history), but ADK stores only the ids it needs to recover and reuse
 the remote state; it never re-sends prior turns.
+
+### System instruction
+
+Set `instruction` on `ManagedAgent` to send a system instruction to the Managed
+Agents API, mirroring `LlmAgent.instruction`. It accepts a plain string — which
+may embed `{state_var}` / `{artifact.name}` / `{var?}` placeholders resolved
+from session state and artifacts at request time — or an `InstructionProvider`
+callable that is invoked with a `ReadonlyContext` and bypasses placeholder
+injection. The resolved instruction is forwarded as the interaction's
+`system_instruction` on every turn, including chained turns; an empty
+`instruction` (the default) sends none.
+
+```python
+from google.adk.agents import ManagedAgent
+
+root_agent = ManagedAgent(
+    name='managed_persona_agent',
+    agent_id='antigravity-preview-05-2026',
+    environment={'type': 'remote'},
+    instruction='You are a terse assistant. Answer in a single sentence.',
+)
+```
 
 ## Advanced applications
 
@@ -154,3 +207,7 @@ the remote state; it never re-sends prior turns.
 
 *   [Managed Agent Basic](../../../../contributing/samples/managed_agent/basic)
 *   [Managed Agent Code Execution](../../../../contributing/samples/managed_agent/code_execution)
+*   [Managed Agent System Instruction](../../../../contributing/samples/managed_agent/system_instruction)
+*   [Managed Agent Remote MCP](../../../../contributing/samples/managed_agent/remote_mcp)
+*   [Managed Agent Single-Turn Orchestration](../../../../contributing/samples/managed_agent/single_turn)
+*   [Managed Agent Create and Use a Custom Agent](../../../../contributing/samples/managed_agent/custom_agent)

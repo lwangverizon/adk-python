@@ -21,6 +21,7 @@ import os
 import ssl
 import tempfile
 from typing import Any
+from urllib.parse import quote
 
 from google.adk.skills import _utils
 from google.adk.skills import models
@@ -28,6 +29,7 @@ from google.adk.skills.skill_registry import SkillRegistry
 from google.adk.utils import _mtls_utils
 import google.auth
 import google.auth.credentials
+from google.auth.credentials import Credentials
 import google.auth.exceptions
 from google.auth.transport import mtls
 from google.auth.transport import requests as auth_requests
@@ -42,16 +44,17 @@ class GCPSkillRegistry(SkillRegistry):
       *,
       project_id: str | None = None,
       location: str | None = None,
+      credentials: Credentials | None = None,
   ):
     """Initializes the GCP Skill Registry.
 
     Args:
       project_id: Optional GCP project ID. If omitted, loads from environment.
       location: Optional GCP location. If omitted, loads from environment.
+      credentials: Optional credentials to use for the client.
     """
     self.project_id = project_id or os.environ.get("GOOGLE_CLOUD_PROJECT")
     self.location = location or os.environ.get("GOOGLE_CLOUD_LOCATION")
-
     # Set up SSL context for mTLS if needed
     self._ssl_context = None
     use_client_cert = _mtls_utils.use_client_cert_effective()
@@ -97,7 +100,7 @@ class GCPSkillRegistry(SkillRegistry):
           "project_id and location must be specified or set via environment"
           " variables."
       )
-    self._credentials: google.auth.credentials.Credentials | None = None
+    self._credentials: Credentials | None = credentials
 
   async def _get_headers(self) -> dict[str, str]:
     """Refreshes credentials and returns authorization headers."""
@@ -162,12 +165,27 @@ class GCPSkillRegistry(SkillRegistry):
 
     Returns:
       A Skill object.
+
+    Raises:
+      ValueError: If the name is not a valid skill name.
     """
+    # The name reaches here straight from a model-issued tool call, so it must
+    # be a single path segment before it is interpolated into the request URL.
+    # Accept the same character set skill names are already held to; the
+    # snake-or-kebab pattern is the superset of the two accepted spellings.
+    # pylint: disable-next=protected-access
+    if not models._SNAKE_OR_KEBAB_NAME_PATTERN.match(name):
+      raise ValueError(
+          f"Invalid skill name {name!r}: name must be lowercase kebab-case"
+          " (a-z, 0-9, hyphens) or snake_case (a-z, 0-9, underscores), with"
+          " no leading, trailing, or consecutive delimiters."
+      )
+
     async with self._create_httpx_client() as client:
       # 1. Fetch the logical Skill metadata
       skill_url = (
           f"{self.base_url}/projects/{self.project_id}/"
-          f"locations/{self.location}/skills/{name}"
+          f"locations/{self.location}/skills/{quote(name, safe='')}"
       )
       response = await self._make_request(client, skill_url)
       skill_data = response.json()

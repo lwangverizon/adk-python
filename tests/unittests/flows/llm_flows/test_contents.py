@@ -89,6 +89,44 @@ async def test_include_contents_default_full_history():
 
 
 @pytest.mark.asyncio
+async def test_chained_interactions_builds_only_current_turn_contents():
+  """Stateful Interactions requests do not copy history the server retains."""
+  agent = Agent(
+      model="gemini-2.5-flash", name="test_agent", include_contents="default"
+  )
+  llm_request = LlmRequest(
+      model="gemini-2.5-flash", previous_interaction_id="interaction-1"
+  )
+  invocation_context = await testing_utils.create_invocation_context(
+      agent=agent
+  )
+  invocation_context.session.events = [
+      Event(
+          invocation_id="inv1",
+          author="user",
+          content=types.UserContent("Historical message"),
+      ),
+      Event(
+          invocation_id="inv2",
+          author="test_agent",
+          content=types.ModelContent("Historical response"),
+      ),
+      Event(
+          invocation_id="inv3",
+          author="user",
+          content=types.UserContent("Current message"),
+      ),
+  ]
+
+  async for _ in contents.request_processor.run_async(
+      invocation_context, llm_request
+  ):
+    pass
+
+  assert llm_request.contents == [types.UserContent("Current message")]
+
+
+@pytest.mark.asyncio
 async def test_include_contents_none_current_turn_only():
   """Test that include_contents='none' includes only current turn context."""
   agent = Agent(
@@ -1286,7 +1324,7 @@ async def test_adk_function_call_ids_preserved_for_interactions_model():
 @pytest.mark.asyncio
 async def test_adk_function_call_ids_preserved_for_anthropic_model():
   """Anthropic ids must round-trip through replay so Claude can match
-  tool_use blocks with their tool_result blocks (issue #5074).
+  tool_use blocks with their tool_result blocks.
   """
   from google.adk.models.anthropic_llm import AnthropicLlm
 
@@ -1837,8 +1875,8 @@ def test_recover_compacted_function_calls_uses_latest_sibling_response():
 def test_get_contents_recovers_compacted_long_running_call_on_resume():
   """A long-running call compacted before resume is restored during assembly.
 
-  Reproduces issue #5602: the call and its intermediate placeholder response are
-  summarized away, then the real result arrives on resume. Without recovery,
+  The call and its intermediate placeholder response are summarized away, then
+  the real result arrives on resume. Without recovery,
   assembly raises because the resumed response has no matching call.
   """
   compaction = EventCompaction(
@@ -1965,3 +2003,41 @@ def test_recover_compacted_parallel_call_reinjects_sibling_response():
       if part.function_response
   }
   assert response_ids == {"lr-1", "reg-1"}
+
+
+def test_task_input_user_content_preserves_non_ascii():
+  """Delegated task input must not escape non-ASCII FC args.
+
+  A chat coordinator delegates to a task sub-agent via a function call; the
+  task agent's first user turn is rebuilt from the FC args. Escaping non-Latin
+  characters to ``\\uXXXX`` there bloats prompt tokens and degrades responses.
+  """
+  fc_id = "fc_task_1"
+  events = [
+      Event(
+          invocation_id="inv1",
+          author="coordinator",
+          content=types.Content(
+              role="model",
+              parts=[
+                  types.Part(
+                      function_call=types.FunctionCall(
+                          id=fc_id,
+                          name="delegate",
+                          args={"query": "שלום עולם", "city": "北京"},
+                      )
+                  )
+              ],
+          ),
+      ),
+  ]
+
+  content = contents._build_task_input_user_content(  # pylint: disable=protected-access
+      events, isolation_scope=fc_id
+  )
+
+  assert content is not None and content.parts
+  text = content.parts[0].text
+  assert "שלום עולם" in text
+  assert "北京" in text
+  assert "\\u" not in text

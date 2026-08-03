@@ -40,6 +40,8 @@ from ..utils._google_client_headers import merge_tracking_headers
 from ..utils.context_utils import Aclosing
 from ..utils.streaming_utils import StreamingResponseAggregator
 from ..utils.variant_utils import GoogleLLMVariant
+from ._capabilities import gemini_output_schema_and_tools
+from ._capabilities import LlmCapabilities
 from .base_llm import BaseLlm
 from .base_llm_connection import BaseLlmConnection
 from .gemini_llm_connection import GeminiLlmConnection
@@ -200,7 +202,7 @@ class Gemini(BaseLlm):
     # Handle context caching if configured
     cache_metadata = None
     cache_manager = None
-    if llm_request.cache_config:
+    if llm_request.cache_config and not self.use_interactions_api:
       from ..telemetry.tracing import tracer
       from .gemini_context_cache_manager import GeminiContextCacheManager
 
@@ -243,7 +245,8 @@ class Gemini(BaseLlm):
           yield llm_response
         return
 
-      logger.debug(_build_request_log(llm_request))
+      if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(_build_request_log(llm_request))
 
       if stream:
         responses = await self.api_client.aio.models.generate_content_stream(
@@ -332,6 +335,16 @@ class Gemini(BaseLlm):
     ):
       yield llm_response
 
+  @property
+  @override
+  def capabilities(self) -> LlmCapabilities:
+    # Declared here rather than inherited from BaseLlm: the base implementation
+    # is a deprecated fallback that warns and will be removed, whereas this is
+    # Gemini's permanent self-report.
+    return LlmCapabilities(
+        output_schema_and_tools=gemini_output_schema_and_tools(self.model),
+    )
+
   @cached_property
   def api_client(self) -> Client:
     """Provides the api client.
@@ -356,8 +369,9 @@ class Gemini(BaseLlm):
     if self.model.startswith('projects/'):
       kwargs['enterprise'] = True
 
-    if self.client_kwargs:
-      kwargs.update(self.client_kwargs)
+    client_kwargs = getattr(self, 'client_kwargs', None)
+    if client_kwargs:
+      kwargs.update(client_kwargs)
 
     return Client(**kwargs)
 
@@ -404,8 +418,9 @@ class Gemini(BaseLlm):
     if self.model.startswith('projects/'):
       kwargs['enterprise'] = True
 
-    if self.client_kwargs:
-      kwargs.update(self.client_kwargs)
+    client_kwargs = getattr(self, 'client_kwargs', None)
+    if client_kwargs:
+      kwargs.update(client_kwargs)
 
     return Client(**kwargs)
 
@@ -501,6 +516,7 @@ class Gemini(BaseLlm):
     )
 
   async def _preprocess_request(self, llm_request: LlmRequest) -> None:
+    from ..tools import load_artifacts_tool  # pylint: disable=import-outside-toplevel
 
     if self._api_backend == GoogleLLMVariant.GEMINI_API:
       # Using API key from Google AI Studio to call model doesn't support labels.
@@ -527,6 +543,24 @@ class Gemini(BaseLlm):
         if isinstance(tool, types.Tool) and tool.computer_use:
           llm_request.config.system_instruction = None
           await self._adapt_computer_use_tool(llm_request)
+
+    # Sanitize inputs by ensuring unsupported inline types (e.g. DOCX from UI)
+    # are converted to plain text using load_artifacts_tool._as_safe_part_for_llm.
+    if llm_request.contents:
+      for content in llm_request.contents:
+        if not content.parts:
+          continue
+        new_parts = []
+        for part in content.parts:
+          if part.inline_data:
+            # GE inline_data does not preserve filenames, so we pass a dummy
+            # 'inline-file' name as a placeholder for
+            # _as_safe_part_for_llm's required artifact_name argument.
+            part = load_artifacts_tool._as_safe_part_for_llm(  # pylint: disable=protected-access
+                part, 'inline-file'
+            )
+          new_parts.append(part)
+        content.parts = new_parts
 
   def _merge_tracking_headers(self, headers: dict[str, str]) -> dict[str, str]:
     """Merge tracking headers to the given headers."""

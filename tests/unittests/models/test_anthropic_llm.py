@@ -22,21 +22,26 @@ from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 
 from anthropic import NOT_GIVEN
+from anthropic import RateLimitError
 from anthropic import types as anthropic_types
 from google.adk import version as adk_version
 from google.adk.models import anthropic_llm
 from google.adk.models import AnthropicGenerateContentConfig
+from google.adk.models.anthropic_llm import _AnthropicRateLimitError
 from google.adk.models.anthropic_llm import AnthropicLlm
 from google.adk.models.anthropic_llm import Claude
 from google.adk.models.anthropic_llm import content_to_message_param
 from google.adk.models.anthropic_llm import function_declaration_to_tool_param
+from google.adk.models.anthropic_llm import message_to_generate_content_response
 from google.adk.models.anthropic_llm import part_to_message_block
+from google.adk.models.anthropic_llm import to_google_genai_finish_reason
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types
 from google.genai import version as genai_version
 from google.genai.types import Content
 from google.genai.types import Part
+import httpx
 import pytest
 
 
@@ -1232,6 +1237,7 @@ async def test_streaming_text_yields_partial_and_final():
   assert responses[2].content.parts[0].text == "Hello world!"
   assert responses[2].usage_metadata.prompt_token_count == 10
   assert responses[2].usage_metadata.candidates_token_count == 5
+  assert responses[2].finish_reason == "STOP"
 
 
 @pytest.mark.asyncio
@@ -1692,6 +1698,45 @@ def test_message_to_generate_content_response_no_cache_read_tokens():
   assert response.usage_metadata.cached_content_token_count is None
 
 
+@pytest.mark.parametrize(
+    "stop_reason, expected_finish_reason",
+    [
+        ("end_turn", "STOP"),
+        ("stop_sequence", "STOP"),
+        ("tool_use", "STOP"),
+        ("max_tokens", "MAX_TOKENS"),
+        (None, None),
+    ],
+)
+def test_message_to_generate_content_response_maps_finish_reason(
+    stop_reason, expected_finish_reason
+):
+  """Anthropic stop_reason maps to the genai finish_reason on the response."""
+  message = anthropic_types.Message(
+      id="msg_finish_reason",
+      content=[
+          anthropic_types.TextBlock(text="hi", type="text", citations=None)
+      ],
+      model="claude-sonnet-4-20250514",
+      role="assistant",
+      stop_reason=stop_reason,
+      stop_sequence=None,
+      type="message",
+      usage=anthropic_types.Usage(
+          input_tokens=5,
+          output_tokens=2,
+          cache_creation_input_tokens=0,
+          cache_read_input_tokens=0,
+          server_tool_use=None,
+          service_tier=None,
+      ),
+  )
+
+  response = message_to_generate_content_response(message)
+
+  assert response.finish_reason == expected_finish_reason
+
+
 def test_part_to_message_block_thinking_roundtrip():
   """Part with thought=True and signature creates ThinkingBlockParam."""
   part = Part(
@@ -1917,6 +1962,83 @@ async def test_streaming_thinking_yields_partial_and_final():
 
   assert final.usage_metadata.prompt_token_count == 15
   assert final.usage_metadata.candidates_token_count == 10
+
+
+@pytest.mark.asyncio
+async def test_streaming_thinking_captures_signature_delta():
+  """A streamed signature_delta must land on the final thinking Part.
+
+  Without this the aggregated thinking Part has no ``thought_signature`` and
+  cannot round-trip back to Claude on the follow-up request after a tool call
+  (extended thinking + tool use), which raises when re-serializing history.
+  """
+  llm = AnthropicLlm(model="claude-sonnet-4-20250514")
+
+  events = [
+      MagicMock(
+          type="message_start",
+          message=MagicMock(usage=MagicMock(input_tokens=15, output_tokens=0)),
+      ),
+      MagicMock(
+          type="content_block_start",
+          index=0,
+          content_block=anthropic_types.ThinkingBlock(
+              thinking="", signature="", type="thinking"
+          ),
+      ),
+      MagicMock(
+          type="content_block_delta",
+          index=0,
+          delta=anthropic_types.ThinkingDelta(
+              thinking="Reason.", type="thinking_delta"
+          ),
+      ),
+      MagicMock(
+          type="content_block_delta",
+          index=0,
+          delta=anthropic_types.SignatureDelta(
+              signature="sig_stream_123", type="signature_delta"
+          ),
+      ),
+      MagicMock(type="content_block_stop", index=0),
+      MagicMock(
+          type="message_delta",
+          delta=MagicMock(stop_reason="end_turn"),
+          usage=MagicMock(output_tokens=5),
+      ),
+      MagicMock(type="message_stop"),
+  ]
+
+  mock_client = MagicMock()
+  mock_client.messages.create = AsyncMock(
+      return_value=_make_mock_stream_events(events)
+  )
+  request = LlmRequest(
+      model="claude-sonnet-4-20250514",
+      contents=[Content(role="user", parts=[Part.from_text(text="What?")])],
+      config=types.GenerateContentConfig(
+          thinking_config=types.ThinkingConfig(thinking_budget=5000),
+      ),
+  )
+
+  with mock.patch.object(llm, "_anthropic_client", mock_client):
+    responses = [
+        r async for r in llm.generate_content_async(request, stream=True)
+    ]
+
+  final = responses[-1]
+  assert not final.partial
+  thinking_part = final.content.parts[0]
+  assert thinking_part.thought
+  assert thinking_part.text == "Reason."
+  assert thinking_part.thought_signature == b"sig_stream_123"
+
+  # The aggregated Part must round-trip back to a valid Anthropic thinking
+  # block -- this is exactly what fails today (missing signature) on a
+  # tool-call turn.
+  block = part_to_message_block(thinking_part)
+  assert block["type"] == "thinking"
+  assert block["signature"] == "sig_stream_123"
 
 
 @pytest.mark.asyncio
@@ -2565,3 +2687,173 @@ async def test_generate_content_async_excludes_sampling_when_effort(
       assert "top_p" not in kwargs
       assert "top_k" not in kwargs
       assert kwargs["output_config"] == {"effort": "xhigh"}
+
+
+@pytest.mark.parametrize(
+    "stop_reason,expected_finish_reason",
+    [
+        ("end_turn", types.FinishReason.STOP),
+        ("stop_sequence", types.FinishReason.STOP),
+        ("tool_use", types.FinishReason.STOP),
+        ("max_tokens", types.FinishReason.MAX_TOKENS),
+        ("pause_turn", types.FinishReason.STOP),
+        ("refusal", types.FinishReason.SAFETY),
+        (None, None),
+        ("unknown", types.FinishReason.FINISH_REASON_UNSPECIFIED),
+    ],
+)
+def test_to_google_genai_finish_reason(stop_reason, expected_finish_reason):
+  """All Anthropic stop_reason values map to the correct ADK FinishReason."""
+  assert to_google_genai_finish_reason(stop_reason) == expected_finish_reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stop_reason,expected_finish_reason",
+    [
+        ("end_turn", types.FinishReason.STOP),
+        ("max_tokens", types.FinishReason.MAX_TOKENS),
+        ("refusal", types.FinishReason.SAFETY),
+    ],
+)
+async def test_non_streaming_sets_finish_reason(
+    stop_reason, expected_finish_reason
+):
+  """finish_reason is populated on the non-streaming LlmResponse."""
+  llm = AnthropicLlm(model="claude-sonnet-4-20250514")
+  mock_message = anthropic_types.Message(
+      id="msg_test",
+      content=[
+          anthropic_types.TextBlock(text="Hi", type="text", citations=None)
+      ],
+      model="claude-sonnet-4-20250514",
+      role="assistant",
+      stop_reason=stop_reason,
+      stop_sequence=None,
+      type="message",
+      usage=anthropic_types.Usage(
+          input_tokens=5,
+          output_tokens=2,
+          cache_creation_input_tokens=0,
+          cache_read_input_tokens=0,
+          server_tool_use=None,
+          service_tier=None,
+      ),
+  )
+  mock_client = MagicMock()
+  mock_client.messages.create = AsyncMock(return_value=mock_message)
+
+  llm_request = LlmRequest(
+      model="claude-sonnet-4-20250514",
+      contents=[Content(role="user", parts=[Part.from_text(text="Hi")])],
+      config=types.GenerateContentConfig(system_instruction="Test"),
+  )
+
+  with mock.patch.object(llm, "_anthropic_client", mock_client):
+    responses = [
+        r async for r in llm.generate_content_async(llm_request, stream=False)
+    ]
+
+  assert len(responses) == 1
+  assert responses[0].finish_reason == expected_finish_reason
+
+
+@pytest.mark.asyncio
+async def test_streaming_sets_finish_reason():
+  """finish_reason is populated on the final streaming LlmResponse."""
+  llm = AnthropicLlm(model="claude-sonnet-4-20250514")
+
+  events = [
+      MagicMock(
+          type="message_start",
+          message=MagicMock(usage=MagicMock(input_tokens=5, output_tokens=0)),
+      ),
+      MagicMock(
+          type="content_block_start",
+          index=0,
+          content_block=anthropic_types.TextBlock(text="", type="text"),
+      ),
+      MagicMock(
+          type="content_block_delta",
+          index=0,
+          delta=anthropic_types.TextDelta(text="Hi", type="text_delta"),
+      ),
+      MagicMock(type="content_block_stop", index=0),
+      MagicMock(
+          type="message_delta",
+          delta=MagicMock(stop_reason="max_tokens"),
+          usage=MagicMock(output_tokens=1),
+      ),
+      MagicMock(type="message_stop"),
+  ]
+
+  mock_client = MagicMock()
+  mock_client.messages.create = AsyncMock(
+      return_value=_make_mock_stream_events(events)
+  )
+
+  llm_request = LlmRequest(
+      model="claude-sonnet-4-20250514",
+      contents=[Content(role="user", parts=[Part.from_text(text="Hi")])],
+      config=types.GenerateContentConfig(system_instruction="Test"),
+  )
+
+  with mock.patch.object(llm, "_anthropic_client", mock_client):
+    responses = [
+        r async for r in llm.generate_content_async(llm_request, stream=True)
+    ]
+
+  final = responses[-1]
+  assert final.finish_reason == types.FinishReason.MAX_TOKENS
+
+
+def _make_rate_limit_error() -> RateLimitError:
+  request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+  response = httpx.Response(429, request=request)
+  return RateLimitError(
+      "rate limited",
+      response=response,
+      body={"type": "error", "error": {"type": "rate_limit_error"}},
+  )
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_wraps_anthropic_rate_limit_error():
+  llm = AnthropicLlm(model="claude-sonnet-4-20250514")
+  mock_client = MagicMock()
+  mock_client.messages.create = AsyncMock(side_effect=_make_rate_limit_error())
+
+  llm_request = LlmRequest(
+      model="claude-sonnet-4-20250514",
+      contents=[Content(role="user", parts=[Part.from_text(text="Hi")])],
+      config=types.GenerateContentConfig(system_instruction="Test"),
+  )
+
+  with mock.patch.object(llm, "_anthropic_client", mock_client):
+    with pytest.raises(_AnthropicRateLimitError) as excinfo:
+      _ = [r async for r in llm.generate_content_async(llm_request)]
+
+  assert "docs.anthropic.com/en/api/errors#http-errors" in str(excinfo.value)
+  assert "rate limited" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_streaming_wraps_anthropic_rate_limit_error():
+  llm = AnthropicLlm(model="claude-sonnet-4-20250514")
+  mock_client = MagicMock()
+  mock_client.messages.create = AsyncMock(side_effect=_make_rate_limit_error())
+
+  llm_request = LlmRequest(
+      model="claude-sonnet-4-20250514",
+      contents=[Content(role="user", parts=[Part.from_text(text="Hi")])],
+      config=types.GenerateContentConfig(system_instruction="Test"),
+  )
+
+  with mock.patch.object(llm, "_anthropic_client", mock_client):
+    with pytest.raises(_AnthropicRateLimitError) as excinfo:
+      _ = [
+          r async for r in llm.generate_content_async(llm_request, stream=True)
+      ]
+
+  assert "docs.anthropic.com/en/api/errors#http-errors" in str(excinfo.value)
+  assert "rate limited" in str(excinfo.value)

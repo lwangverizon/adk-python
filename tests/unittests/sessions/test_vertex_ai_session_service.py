@@ -810,6 +810,41 @@ async def test_get_session_with_after_timestamp_filter():
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures('mock_get_api_client')
+async def test_get_session_with_num_recent_events_and_after_timestamp():
+  session_service = mock_vertex_ai_session_service()
+  session = await session_service.get_session(
+      app_name='123',
+      user_id='user',
+      session_id='2',
+      config=GetSessionConfig(
+          num_recent_events=2,
+          after_timestamp=isoparse('2024-12-12T12:12:13.0Z').timestamp(),
+      ),
+  )
+  assert session is not None
+  # after_timestamp must be applied even though num_recent_events is set;
+  # without it both events would be returned.
+  assert len(session.events) == 1
+  assert session.events[0].id == '456'
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('mock_get_api_client')
+async def test_get_session_with_num_recent_events_zero_drops_all_events():
+  """num_recent_events=0 returns no events (0 != unset; events[-0:] keeps all)."""
+  session_service = mock_vertex_ai_session_service()
+  session = await session_service.get_session(
+      app_name='123',
+      user_id='user',
+      session_id='2',
+      config=GetSessionConfig(num_recent_events=0),
+  )
+  assert session is not None
+  assert not session.events
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('mock_get_api_client')
 async def test_get_session_keeps_events_newer_than_update_time(
     mock_api_client_instance: MockAsyncClient,
 ) -> None:
@@ -1147,7 +1182,7 @@ async def test_append_event():
 async def test_append_event_strips_unsupported_part_metadata(
     mock_api_client_instance: MockAsyncClient,
 ) -> None:
-  """part_metadata must not reach the Sessions API (#6014).
+  """part_metadata must not reach the Sessions API.
 
   ``Part.part_metadata`` is a Gemini Developer API-only field; the Vertex AI
   Agent Engine Sessions ``appendEvent`` API rejects it with 400 INVALID_ARGUMENT
@@ -1189,7 +1224,7 @@ async def test_append_event_strips_unsupported_part_metadata(
 async def test_append_event_with_part_metadata_round_trips(
     mock_api_client_instance: MockAsyncClient,
 ) -> None:
-  """Reconstruction side of #6014: an event carrying part_metadata appends and
+  """Reconstruction side: an event carrying part_metadata appends and
   reads back without error. part_metadata is dropped (unsupported on Vertex),
   but the session round-trips and the part text is preserved.
   """

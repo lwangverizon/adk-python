@@ -37,6 +37,7 @@ from anthropic import AsyncAnthropic
 from anthropic import AsyncAnthropicVertex
 from anthropic import NOT_GIVEN
 from anthropic import NotGiven
+from anthropic import RateLimitError
 from anthropic import types as anthropic_types
 from google.genai import types
 from pydantic import BaseModel
@@ -55,6 +56,28 @@ if TYPE_CHECKING:
 __all__ = ["AnthropicLlm", "Claude", "AnthropicGenerateContentConfig"]
 
 logger = logging.getLogger("google_adk." + __name__)
+
+
+_RATE_LIMIT_POSSIBLE_FIX_MESSAGE = (
+    "On how to mitigate this issue, please refer to:\n\n"
+    "https://docs.anthropic.com/en/api/errors#http-errors"
+)
+
+
+# anthropic is an optional dependency, so mypy resolves the base class to Any.
+class _AnthropicRateLimitError(RateLimitError):  # type: ignore[misc]
+  """Represents a rate limit error received from Anthropic."""
+
+  def __init__(self, rate_limit_error: RateLimitError):
+    super().__init__(
+        str(rate_limit_error),
+        response=rate_limit_error.response,
+        body=getattr(rate_limit_error, "body", None),
+    )
+
+  def __str__(self) -> str:
+    base_message = super().__str__()
+    return f"{_RATE_LIMIT_POSSIBLE_FIX_MESSAGE}\n\n{base_message}"
 
 
 @dataclasses.dataclass
@@ -231,14 +254,26 @@ def to_claude_role(role: Optional[str]) -> Literal["user", "assistant"]:
   return "user"
 
 
+# Mapping of Anthropic stop_reason strings to FinishReason enum values
+_STOP_REASON_MAPPING: dict[anthropic_types.StopReason, types.FinishReason] = {
+    "end_turn": types.FinishReason.STOP,
+    "stop_sequence": types.FinishReason.STOP,
+    "tool_use": types.FinishReason.STOP,
+    "pause_turn": types.FinishReason.STOP,
+    "max_tokens": types.FinishReason.MAX_TOKENS,
+    "refusal": types.FinishReason.SAFETY,
+}
+
+
 def to_google_genai_finish_reason(
-    anthropic_stop_reason: Optional[str],
-) -> types.FinishReason:
-  if anthropic_stop_reason in ["end_turn", "stop_sequence", "tool_use"]:
-    return "STOP"
-  if anthropic_stop_reason == "max_tokens":
-    return "MAX_TOKENS"
-  return "FINISH_REASON_UNSPECIFIED"
+    anthropic_stop_reason: Optional[anthropic_types.StopReason],
+) -> types.FinishReason | None:
+  """Maps Anthropic stop_reason to Google GenAI FinishReason."""
+  if anthropic_stop_reason is None:
+    return None
+  return _STOP_REASON_MAPPING.get(
+      anthropic_stop_reason, types.FinishReason.FINISH_REASON_UNSPECIFIED
+  )
 
 
 def _is_image_part(part: types.Part) -> bool:
@@ -499,8 +534,7 @@ def message_to_generate_content_response(
           ),
           cached_content_token_count=_extract_cached_token_count(message.usage),
       ),
-      # TODO: Deal with these later.
-      # finish_reason=to_google_genai_finish_reason(message.stop_reason),
+      finish_reason=to_google_genai_finish_reason(message.stop_reason),
   )
 
 
@@ -733,17 +767,20 @@ class AnthropicLlm(BaseLlm):
     )
     thinking = _build_anthropic_thinking_param(llm_request.config)
 
-    if not stream:
-      kwargs = self._build_anthropic_kwargs(
-          llm_request, messages, tools, tool_choice, thinking
-      )
-      message = await self._anthropic_client.messages.create(**kwargs)
-      yield message_to_generate_content_response(message)
-    else:
-      async for response in self._generate_content_streaming(
-          llm_request, messages, tools, tool_choice, thinking
-      ):
-        yield response
+    try:
+      if not stream:
+        kwargs = self._build_anthropic_kwargs(
+            llm_request, messages, tools, tool_choice, thinking
+        )
+        message = await self._anthropic_client.messages.create(**kwargs)
+        yield message_to_generate_content_response(message)
+      else:
+        async for response in self._generate_content_streaming(
+            llm_request, messages, tools, tool_choice, thinking
+        ):
+          yield response
+    except RateLimitError as rate_limit_error:
+      raise _AnthropicRateLimitError(rate_limit_error) from rate_limit_error
 
   async def _generate_content_streaming(
       self,
@@ -788,6 +825,7 @@ class AnthropicLlm(BaseLlm):
     input_tokens = 0
     output_tokens = 0
     cached_input_tokens: int | None = None
+    stop_reason: Optional[anthropic_types.StopReason] = None
 
     async for event in raw_stream:
       if event.type == "message_start":
@@ -829,6 +867,20 @@ class AnthropicLlm(BaseLlm):
               ),
               partial=True,
           )
+        elif isinstance(delta, anthropic_types.SignatureDelta):
+          # Claude streams the thinking block's cryptographic signature as a
+          # separate delta near the end of the block. Accumulate it so the
+          # aggregated thinking Part below carries ``thought_signature``.
+          # Without it the reasoning block cannot round-trip back to Claude on
+          # the next request -- extended thinking + tool use requires echoing
+          # the signed thinking blocks, and re-serializing history for the
+          # follow-up call would otherwise fail. Not surfaced as a partial (the
+          # signature is opaque, not user-visible text).
+          thinking_blocks.setdefault(
+              event.index,
+              _ThinkingAccumulator(thinking="", signature=""),
+          )
+          thinking_blocks[event.index].signature += delta.signature
         elif isinstance(delta, anthropic_types.TextDelta):
           text_blocks.setdefault(event.index, "")
           text_blocks[event.index] += delta.text
@@ -845,6 +897,8 @@ class AnthropicLlm(BaseLlm):
 
       elif event.type == "message_delta":
         output_tokens = event.usage.output_tokens
+        if event.delta and event.delta.stop_reason:
+          stop_reason = event.delta.stop_reason
 
     # Build the final aggregated response with all content.
     all_parts: list[types.Part] = []
@@ -887,6 +941,7 @@ class AnthropicLlm(BaseLlm):
             total_token_count=input_tokens + output_tokens,
             cached_content_token_count=cached_input_tokens,
         ),
+        finish_reason=to_google_genai_finish_reason(stop_reason),
         partial=False,
     )
 

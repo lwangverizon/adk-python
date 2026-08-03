@@ -18,8 +18,12 @@ from google.adk.evaluation.eval_config import _DEFAULT_EVAL_CONFIG
 from google.adk.evaluation.eval_config import EvalConfig
 from google.adk.evaluation.eval_config import get_eval_metrics_from_config
 from google.adk.evaluation.eval_config import get_evaluation_criteria_or_default
+from google.adk.evaluation.eval_metrics import EvalMetric
+from google.adk.evaluation.eval_metrics import JudgeModelOptions
+from google.adk.evaluation.eval_metrics import LlmAsAJudgeCriterion
 from google.adk.evaluation.eval_rubrics import Rubric
 from google.adk.evaluation.eval_rubrics import RubricContent
+from google.adk.evaluation.simulation._llm_audio_user_simulator import LlmAudioUserSimulatorConfig
 from google.adk.evaluation.simulation.llm_backed_user_simulator import LlmBackedUserSimulatorConfig
 from pydantic import ValidationError
 import pytest
@@ -138,6 +142,65 @@ def test_get_eval_metrics_from_config_empty_criteria():
   assert not eval_metrics
 
 
+def test_eval_metric_dump_preserves_concrete_criterion_fields():
+  """Serializing a metric must not degrade its criterion to the base class."""
+  eval_metric = EvalMetric(
+      metric_name="final_response_match_v2",
+      criterion=LlmAsAJudgeCriterion(
+          threshold=0.8,
+          judge_model_options=JudgeModelOptions(
+              judge_model="my-judge", num_samples=3
+          ),
+      ),
+  )
+
+  dumped = eval_metric.model_dump()
+
+  assert dumped["criterion"]["judge_model_options"]["judge_model"] == "my-judge"
+  assert dumped["criterion"]["judge_model_options"]["num_samples"] == 3
+
+
+def test_eval_metric_criterion_survives_json_round_trip():
+  """A serialized metric still yields its concrete criterion when reloaded."""
+  eval_metric = EvalMetric(
+      metric_name="final_response_match_v2",
+      criterion=LlmAsAJudgeCriterion(
+          threshold=0.8,
+          judge_model_options=JudgeModelOptions(judge_model="my-judge"),
+      ),
+  )
+
+  restored = EvalMetric.model_validate_json(eval_metric.model_dump_json())
+  criterion = LlmAsAJudgeCriterion.model_validate(
+      restored.criterion.model_dump()
+  )
+
+  assert criterion.judge_model_options.judge_model == "my-judge"
+
+
+def test_eval_config_dump_preserves_concrete_criterion_fields():
+  """Criteria values keep their subclass fields, and plain thresholds survive."""
+  eval_config = EvalConfig(
+      criteria={
+          "tool_trajectory_avg_score": 1.0,
+          "final_response_match_v2": LlmAsAJudgeCriterion(
+              threshold=0.8,
+              judge_model_options=JudgeModelOptions(judge_model="my-judge"),
+          ),
+      }
+  )
+
+  dumped = eval_config.model_dump()
+
+  assert dumped["criteria"]["tool_trajectory_avg_score"] == 1.0
+  assert (
+      dumped["criteria"]["final_response_match_v2"]["judge_model_options"][
+          "judge_model"
+      ]
+      == "my-judge"
+  )
+
+
 # -----------------------------------------------------------------------------
 # `user_simulator_config` discriminator + backward-compat coverage
 # -----------------------------------------------------------------------------
@@ -165,6 +228,26 @@ def test_user_simulator_config_json_with_explicit_type():
       eval_config.user_simulator_config, LlmBackedUserSimulatorConfig
   )
   assert eval_config.user_simulator_config.type == "llm_backed"
+  assert eval_config.user_simulator_config.model == "my-model"
+  assert eval_config.user_simulator_config.max_allowed_invocations == 5
+
+
+def test_user_simulator_config_json_with_llm_audio_type():
+  """A JSON config that carries `type=llm_audio` should deserialize to the
+
+  `LlmAudioUserSimulatorConfig` subclass via the `type` discriminator.
+  """
+  payload = (
+      '{"criteria": {"tool_trajectory_avg_score": 1.0},'
+      ' "userSimulatorConfig": {"type": "llm_audio",'
+      ' "model": "my-model", "maxAllowedInvocations": 5}}'
+  )
+  eval_config = EvalConfig.model_validate_json(payload)
+
+  assert isinstance(
+      eval_config.user_simulator_config, LlmAudioUserSimulatorConfig
+  )
+  assert eval_config.user_simulator_config.type == "llm_audio"
   assert eval_config.user_simulator_config.model == "my-model"
   assert eval_config.user_simulator_config.max_allowed_invocations == 5
 
@@ -264,3 +347,20 @@ def test_user_simulator_config_python_construction():
       eval_config.user_simulator_config, LlmBackedUserSimulatorConfig
   )
   assert eval_config.user_simulator_config.model == "py-model"
+
+
+from google.adk.evaluation.eval_config import LiveModelConfig
+
+
+def test_live_model_config_defaults_to_none():
+  eval_config = EvalConfig(criteria={})
+  assert eval_config.live_model_config is None
+
+
+def test_live_model_config_from_json():
+  eval_config = EvalConfig.model_validate({
+      "criteria": {},
+      "liveModelConfig": {"timeoutSeconds": 600},
+  })
+  assert isinstance(eval_config.live_model_config, LiveModelConfig)
+  assert eval_config.live_model_config.timeout_seconds == 600
