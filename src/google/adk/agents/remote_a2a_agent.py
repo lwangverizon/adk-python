@@ -145,8 +145,8 @@ def _add_mock_function_call(event: Event, state: TaskState) -> None:
   output_parts, long_running_tool_ids = (
       _create_mock_function_call_for_required_user_input(
           state,
-          event.content.parts,
-          event.long_running_tool_ids,
+          event.content.parts or [],
+          event.long_running_tool_ids or set(),
       )
   )
   event.content.parts = output_parts
@@ -248,6 +248,12 @@ class RemoteA2aAgent(BaseAgent):
     # Validate and store agent card reference
     if isinstance(agent_card, AgentCard):
       self._agent_card = agent_card
+      # Update description if empty. A card supplied directly never goes
+      # through the resolution path, so adopt it here instead; a parent agent
+      # reads the description to build its transfer instruction, which happens
+      # before this agent ever runs.
+      if not self.description and agent_card.description:
+        self.description = agent_card.description
     elif isinstance(agent_card, str):
       if not agent_card.strip():
         raise ValueError("agent_card string cannot be empty")
@@ -329,14 +335,15 @@ class RemoteA2aAgent(BaseAgent):
       self, ctx: Optional[InvocationContext] = None
   ) -> AgentCard:
     """Resolve agent card from source."""
+    agent_card_source = self._agent_card_source
+    if agent_card_source is None:
+      raise AgentCardResolutionError("No agent card source was configured.")
 
     # Determine if source is URL or file path
-    if self._agent_card_source.startswith(("http://", "https://")):
-      return await self._resolve_agent_card_from_url(
-          self._agent_card_source, ctx
-      )
+    if agent_card_source.startswith(("http://", "https://")):
+      return await self._resolve_agent_card_from_url(agent_card_source, ctx)
     else:
-      return await self._resolve_agent_card_from_file(self._agent_card_source)
+      return await self._resolve_agent_card_from_file(agent_card_source)
 
   async def _validate_agent_card(self, agent_card: AgentCard) -> None:
     """Validate resolved agent card."""
@@ -521,16 +528,24 @@ class RemoteA2aAgent(BaseAgent):
               )
           )
       new_event = event.model_copy(deep=True)
+      if new_event.content is None:
+        return None
       new_event.content.parts = new_parts
       event = new_event
 
     a2a_message = convert_event_to_a2a_message(
         event, ctx, _compat.ROLE_USER, self._genai_part_converter
     )
+    if a2a_message is None:
+      return None
     if function_call_event.custom_metadata:
       metadata = function_call_event.custom_metadata
-      a2a_message.task_id = metadata.get(A2A_METADATA_PREFIX + "task_id")
-      a2a_message.context_id = metadata.get(A2A_METADATA_PREFIX + "context_id")
+      task_id = metadata.get(A2A_METADATA_PREFIX + "task_id")
+      if isinstance(task_id, str):
+        a2a_message.task_id = task_id
+      context_id = metadata.get(A2A_METADATA_PREFIX + "context_id")
+      if isinstance(context_id, str):
+        a2a_message.context_id = context_id
 
     return a2a_message
 
@@ -644,7 +659,7 @@ class RemoteA2aAgent(BaseAgent):
               and event.content is not None
               and event.content.parts
           ):
-            for part in event.content.parts:
+            for part in event.content.parts or []:
               part.thought = True
           _add_mock_function_call(event, task.status.state)
         elif isinstance(update, A2ATaskStatusUpdateEvent) and (
@@ -667,7 +682,7 @@ class RemoteA2aAgent(BaseAgent):
               _compat.TS_SUBMITTED,
               _compat.TS_WORKING,
           ):
-            for part in event.content.parts:
+            for part in event.content.parts or []:
               part.thought = True
           _add_mock_function_call(event, update.status.state)
         elif isinstance(update, A2ATaskArtifactUpdateEvent):
@@ -853,13 +868,16 @@ class RemoteA2aAgent(BaseAgent):
     logger.debug(build_a2a_request_log(a2a_request))
 
     try:
-      a2a_request, parameters = await execute_before_request_interceptors(
-          self._config.request_interceptors, ctx, a2a_request
+      intercepted_request, parameters = (
+          await execute_before_request_interceptors(
+              self._config.request_interceptors, ctx, a2a_request
+          )
       )
 
-      if isinstance(a2a_request, Event):
-        yield a2a_request
+      if isinstance(intercepted_request, Event):
+        yield intercepted_request
         return
+      a2a_request = intercepted_request
 
       # Backward compatibility
       if self._a2a_request_meta_provider:
@@ -929,6 +947,7 @@ class RemoteA2aAgent(BaseAgent):
     except _compat.A2A_HTTP_ERRORS as e:
       error_message = f"A2A request failed: {e}"
       logger.error(error_message)
+      status_code: object = getattr(e, "status_code", None)
       yield Event(
           author=self.name,
           error_message=error_message,
@@ -937,7 +956,7 @@ class RemoteA2aAgent(BaseAgent):
           custom_metadata={
               A2A_METADATA_PREFIX + "request": _compat.a2a_to_dict(a2a_request),
               A2A_METADATA_PREFIX + "error": error_message,
-              A2A_METADATA_PREFIX + "status_code": str(e.status_code),
+              A2A_METADATA_PREFIX + "status_code": str(status_code),
           },
       )
 
