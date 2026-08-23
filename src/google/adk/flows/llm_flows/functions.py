@@ -27,7 +27,6 @@ import json
 import logging
 import threading
 from typing import Any
-from typing import AsyncGenerator
 from typing import Callable
 from typing import cast
 from typing import Dict
@@ -77,6 +76,13 @@ _TOOL_THREAD_POOLS: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, dict[int, ThreadPoolExecutor]
 ] = weakref.WeakKeyDictionary()
 _TOOL_THREAD_POOL_LOCK = threading.Lock()
+
+# The deepest container whose entries are searched for media: the value a tool
+# returns, and one container inside it. Searching further would mean walking a
+# tool's own data structures on every call, whether or not it ever returns
+# media, and the bound also stops a self-referential result being walked
+# forever.
+_MAX_MEDIA_CONTAINER_DEPTH = 1
 
 
 def _detect_error_type_for_telemetry(
@@ -331,7 +337,17 @@ def build_auth_request_event(
   parts: list[types.Part] = []
   long_running_tool_ids: set[str] = set()
 
+  deduplicated_requests: dict[str, AuthConfig] = {}
+  seen_keys = set()
   for function_call_id, auth_config in auth_requests.items():
+    key = auth_config.credential_key
+    if not key:
+      deduplicated_requests[function_call_id] = auth_config
+    elif key not in seen_keys:
+      seen_keys.add(key)
+      deduplicated_requests[function_call_id] = auth_config
+
+  for function_call_id, auth_config in deduplicated_requests.items():
     request_id = generate_client_function_call_id()
     request_euc_function_call = types.FunctionCall(
         name=REQUEST_EUC_FUNCTION_CALL_NAME,
@@ -814,6 +830,9 @@ async def _execute_single_function_call_live(
   )
   detected_error_type: Optional[str] = None
 
+  # TODO: thread a ToolConfirmation through here so an approved tool can be
+  # re-executed in live mode. `tool_confirmation` is always None on this path,
+  # so a confirmation-gated tool can only ever be refused, never resumed.
   tool_context = _create_tool_context(invocation_context, function_call)
 
   try:
@@ -1007,6 +1026,93 @@ async def _execute_single_function_call_live(
       return tel_ctx.function_response_event
 
 
+_MESSAGE_EVENT_FIELDS = frozenset({'content', 'id', 'timestamp'})
+"""The Event fields a streaming tool's message is built from.
+
+``id`` and ``timestamp`` are stamped at construction, so every Event carries
+them and neither says anything about what the tool asked for.
+"""
+
+
+def _message_content_for_user(
+    event: Event, *, tool: BaseTool
+) -> Optional[types.Content]:
+  """Returns the content to deliver, or None if the event has no message.
+
+  Only the ``content`` field is considered for delivery. All other fields are
+  ignored. The role is set to "user", overriding any other value.
+
+  Args:
+    event: The event the tool yielded.
+    tool: The tool that yielded it, named in the warning.
+
+  Returns:
+    The content to send to the user, or None if there is nothing to send.
+  """
+  problem = None
+  if not event.content:
+    problem = 'it has no content, so there is nothing to deliver'
+  elif event.model_dump(
+      exclude=set(_MESSAGE_EVENT_FIELDS),
+      exclude_defaults=True,
+      # Load-bearing beside exclude_defaults: a field with a custom serializer
+      # skips the default comparison, so ``long_running_tool_ids`` reports as
+      # set on every event. This reads the raw value instead.
+      exclude_none=True,
+      # Only the presence of a field is read, so a mistyped value is not worth
+      # a warning of its own.
+      warnings=False,
+  ):
+    problem = 'it sets fields beyond the message, which are ignored'
+
+  if problem:
+    logger.warning(
+        'Streaming tool `%s` yielded an Event that is not a purely'
+        ' user-facing message: %s. To send a message, use Event(message=...)',
+        tool.name,
+        problem,
+    )
+  if not event.content:
+    return None
+  return event.content.model_copy(deep=True, update={'role': 'user'})
+
+
+async def _emit_streaming_tool_event(
+    event: Event,
+    *,
+    tool: BaseTool,
+    tool_context: ToolContext,
+    invocation_context: InvocationContext,
+) -> None:
+  """Streams an Event yielded by a streaming tool to the user.
+
+  Args:
+    event: The event the tool yielded.
+    tool: The tool that yielded it, named in the branch and in any warning.
+    tool_context: The context of the call, for its function call id.
+    invocation_context: The invocation to enqueue on.
+  """
+  content = _message_content_for_user(event, tool=tool)
+  if content is None:
+    return
+  # Built fresh rather than copied, so the delivered event carries the message
+  # and nothing else, and each delivery gets its own id and timestamp: a tool
+  # may hold one Event and yield it twice, and the session orders events and
+  # decides what compaction has already summarized by timestamp.
+  await invocation_context._enqueue_event(
+      Event(
+          content=content,
+          author=_require_agent_name(invocation_context),
+          invocation_id=invocation_context.invocation_id,
+          branch=(
+              f'{tool.name}@{tool_context.function_call_id}'
+              if tool_context.function_call_id
+              else tool.name
+          ),
+      )
+  )
+
+
 async def _process_function_live_helper(
     tool: BaseTool,
     tool_context: ToolContext,
@@ -1084,28 +1190,67 @@ async def _process_function_live_helper(
         function_args: dict[str, Any],
         tool_context: ToolContext,
     ) -> None:
+      live_request_queue = invocation_context.live_request_queue
+      if live_request_queue is None:
+        raise RuntimeError('Streaming tools require a live request queue.')
       try:
-        async with Aclosing(
-            __call_tool_live(
-                tool=tool,
-                args=function_args,
-                tool_context=tool_context,
-                invocation_context=invocation_context,
-            )
-        ) as agen:
-          async for result in agen:
-            updated_content = _build_function_response_content(
-                tool, result, tool_context.function_call_id
-            )
-            live_request_queue = invocation_context.live_request_queue
-            if live_request_queue is None:
-              raise RuntimeError(
-                  'Streaming tools require a live request queue.'
+        res = await __call_tool_async(
+            tool=tool,
+            args=function_args,
+            tool_context=tool_context,
+        )
+        if inspect.isasyncgen(res):
+          async with Aclosing(res) as agen:
+            async for result in agen:
+              if isinstance(result, Event):
+                await _emit_streaming_tool_event(
+                    result,
+                    tool=tool,
+                    tool_context=tool_context,
+                    invocation_context=invocation_context,
+                )
+                continue
+
+              updated_content = _build_function_response_content(
+                  tool, result, tool_context.function_call_id
               )
-            live_request_queue.send_content(updated_content, partial=True)
+              live_request_queue.send_content(updated_content, partial=True)
+        else:
+          # `res` is a single terminal payload (e.g. the error dict returned
+          # when confirmation is required/rejected or a mandatory argument is
+          # missing), not a chunk of a stream.
+          # TODO: for the confirmation-required case, hold the call pending
+          # (as long-running tools do) instead of relaying the error. Relaying
+          # it closes the call id with the model, so a later approval would
+          # have to send a second response reusing that same id.
+          updated_content = _build_function_response_content(
+              tool, res, tool_context.function_call_id
+          )
+          live_request_queue.send_content(updated_content, partial=False)
       except asyncio.CancelledError:
         raise  # Re-raise to properly propagate the cancellation
+      except Exception:  # pylint: disable=broad-except
+        # The model already got a `pending` response for this call, so it waits
+        # for a follow-up FunctionResponse. Swallowing the exception here would
+        # leave the live session hanging, so report the failure to the model.
+        # The exception text is deliberately not forwarded to the model: it can
+        # carry internal detail that is irrelevant to it. It is logged instead.
+        logger.exception('Error executing streaming tool %s.', tool.name)
+        error_content = _build_function_response_content(
+            tool,
+            {
+                'error': (
+                    f'Invoking `{tool.name}()` failed with an internal error.'
+                )
+            },
+            tool_context.function_call_id,
+        )
+        live_request_queue.send_content(error_content, partial=False)
 
+    # TODO: resolve `require_confirmation` before spawning the task. The
+    # confirmation request is recorded on `tool_context.actions` by the
+    # background task while the caller builds the response event, and nothing
+    # orders the two, so the request can be missing from the emitted event.
     task = asyncio.create_task(
         run_tool_and_update_queue(streaming_tool, function_args, tool_context)
     )
@@ -1265,28 +1410,64 @@ def _as_function_response_part(
 ) -> Optional[types.FunctionResponsePart]:
   """Converts a tool-returned part into a function response part.
 
-  Returns None when the value is not a part carrying usable inline media.
+  Returns None when the value is not a part carrying usable media.
   """
   if not isinstance(value, types.Part):
     return None
   blob = value.inline_data
-  if blob is None or blob.data is None or not blob.mime_type:
-    return None
-  return types.FunctionResponsePart.from_bytes(
-      data=blob.data, mime_type=blob.mime_type
-  )
+  if blob is not None and blob.data is not None and blob.mime_type:
+    return types.FunctionResponsePart.from_bytes(
+        data=blob.data, mime_type=blob.mime_type
+    )
+  file = value.file_data
+  if file is not None and file.file_uri and file.mime_type:
+    return types.FunctionResponsePart.from_uri(
+        file_uri=file.file_uri, mime_type=file.mime_type
+    )
+  return None
+
+
+def _extract_media_from_entry(
+    value: object,
+    parts: list[types.FunctionResponsePart],
+    depth: int,
+) -> tuple[bool, object]:
+  """Removes media from one entry of a tool result.
+
+  Any parts found are appended to ``parts``. Only dicts, lists and tuples are
+  descended into, so an arbitrary object a tool returns is left alone.
+
+  Returns:
+    Whether the entry should be kept, and what is left of it. An entry that
+    was media, or a container left empty once its media was taken out, is not
+    kept.
+  """
+  part = _as_function_response_part(value)
+  if part is not None:
+    parts.append(part)
+    return False, None
+  if depth >= _MAX_MEDIA_CONTAINER_DEPTH or not isinstance(
+      value, (dict, list, tuple)
+  ):
+    return True, value
+  remaining, nested_parts = _extract_multimodal_parts(value, depth + 1)
+  if not nested_parts:
+    return True, value
+  parts.extend(nested_parts)
+  return bool(remaining), remaining
 
 
 def _extract_multimodal_parts(
     function_result: object,
+    depth: int = 0,
 ) -> tuple[object, Optional[list[types.FunctionResponsePart]]]:
-  """Moves inline media in a tool result into function response parts.
+  """Moves media in a tool result into function response parts.
 
-  A tool result is otherwise required to be JSON-serializable, which leaves
-  no way to hand back bytes except by encoding them into a string the model
-  reads as text. A tool that produces an image, audio clip or document
-  returns a part holding the raw bytes instead, either on its own or among
-  the entries of a returned list or dict.
+  A tool result is otherwise required to be JSON-serializable, which leaves no
+  way to hand back media except by encoding it into a string the model reads
+  as text. A tool that produces an image, audio clip or document returns a
+  part holding the raw bytes or a uri instead, on its own or among the entries
+  of a returned container, which may itself hold a container of parts.
 
   Returns:
     The result with the media removed, and the extracted parts. The parts are
@@ -1302,20 +1483,16 @@ def _extract_multimodal_parts(
   if isinstance(function_result, dict):
     kept_items = {}
     for key, value in function_result.items():
-      part = _as_function_response_part(value)
-      if part is None:
-        kept_items[key] = value
-      else:
-        parts.append(part)
+      keep, kept = _extract_media_from_entry(value, parts, depth)
+      if keep:
+        kept_items[key] = kept
     remaining = kept_items
   elif isinstance(function_result, (list, tuple)):
     kept_values = []
     for value in function_result:
-      part = _as_function_response_part(value)
-      if part is None:
-        kept_values.append(value)
-      else:
-        parts.append(part)
+      keep, kept = _extract_media_from_entry(value, parts, depth)
+      if keep:
+        kept_values.append(kept)
     remaining = kept_values
   else:
     return function_result, None
@@ -1323,24 +1500,6 @@ def _extract_multimodal_parts(
   if not parts:
     return function_result, None
   return remaining or {}, parts
-
-
-async def __call_tool_live(
-    tool: FunctionTool,
-    args: dict[str, Any],
-    tool_context: ToolContext,
-    invocation_context: InvocationContext,
-) -> AsyncGenerator[object, None]:
-  """Calls the tool asynchronously (awaiting the coroutine)."""
-  async with Aclosing(
-      tool._call_live(
-          args=args,
-          tool_context=tool_context,
-          invocation_context=invocation_context,
-      )
-  ) as agen:
-    async for item in agen:
-      yield item
 
 
 async def __call_tool_async(
@@ -1383,35 +1542,40 @@ def __build_response_event(
       function_response_parts,
   )
 
-  # When summarization is skipped for an AgentTool, ensure a displayable text
-  # part is added so the sub-agent's output is not lost in UIs that don't render
-  # function responses. This is scoped to AgentTool deliberately: other tools
-  # (e.g. UI/widget-rendering tools) set skip_summarization precisely because
-  # their function response is an internal ack that must NOT be surfaced as
-  # visible text. Control-flow tools (e.g. exit_loop) set skip_summarization but
-  # return no meaningful output; their None result is normalized to
-  # {'result': None}, so skip those to avoid emitting a noisy "null" text part.
-  #
-  # Local import to avoid a circular import (agents -> flows -> tools -> agents);
-  # AgentTool pulls in the agents package, so it cannot be imported at module top.
-  from ...tools.agent_tool import AgentTool
-
-  has_displayable_result = display_result is not None and display_result != {
-      'result': None
-  }
+  # When summarization is skipped, ensure a displayable text part is added so
+  # the tool's output is not lost in UIs that don't render function responses.
+  # Control-flow tools (e.g. exit_loop) are also skipped to avoid emitting a
+  # noisy "null" text part.
+  has_displayable_result = (
+      display_result is not None
+      and display_result != {'result': None}
+      and display_result != ''
+  )
   if (
-      isinstance(tool, AgentTool)
-      and tool_context.actions.skip_summarization
+      tool_context.actions.skip_summarization
       and 'error' not in function_result
       and has_displayable_result
   ):
-    if isinstance(display_result, str):
-      result_text = display_result
-    else:
-      result_text = json.dumps(display_result, ensure_ascii=False, default=str)
-    if content.parts is None:
-      raise RuntimeError('Function response content must contain parts.')
-    content.parts.append(types.Part.from_text(text=result_text))
+    # Imported lazily: AgentTool is only needed on the skip-summarization
+    # path, so it is not worth pulling into every functions.py import.
+    from ...tools.agent_tool import AgentTool
+
+    # This is scoped to AgentTool deliberately: other tools (e.g. UI/widget-
+    # rendering tools) set skip_summarization precisely because their function
+    # response is an internal acknowledgement that must NOT be surfaced as
+    # visible text. AgentTool subclasses can still return None (e.g.
+    # _SingleTurnAgentTool delegating to run_node), hence the
+    # has_displayable_result guard above.
+    if isinstance(tool, AgentTool):
+      if isinstance(display_result, str):
+        result_text = display_result
+      else:
+        result_text = json.dumps(
+            display_result, ensure_ascii=False, default=str
+        )
+      if content.parts is None:
+        raise RuntimeError('Function response content must contain parts.')
+      content.parts.append(types.Part.from_text(text=result_text))
 
   function_response_event = Event(
       invocation_id=invocation_context.invocation_id,
@@ -1431,6 +1595,17 @@ def _build_function_response_content(
     function_response_parts: Optional[list[types.FunctionResponsePart]] = None,
 ) -> types.Content:
   """Builds the content carrying a tool result as a FunctionResponse."""
+  # A streaming tool that wants a different Live scheduling mode for one
+  # particular chunk hands back a FunctionResponse holding that chunk's
+  # payload and mode. Only those two fields are read: `id` and `name` have to
+  # address the function call being answered, which a tool cannot know, so ADK
+  # keeps owning them. Unwrapped before the extraction below so that media in
+  # the payload is still reachable.
+  scheduling_override = None
+  if isinstance(function_result, types.FunctionResponse):
+    scheduling_override = function_result.scheduling
+    function_result = function_result.response
+
   if function_response_parts is None:
     function_result, function_response_parts = _extract_multimodal_parts(
         function_result
@@ -1449,8 +1624,15 @@ def _build_function_response_content(
   if function_response is None:
     raise RuntimeError('Function response part was not created.')
   function_response.id = function_call_id
-  if tool.response_scheduling is not None:
-    function_response.scheduling = tool.response_scheduling
+  # A scheduling asked for on this one result wins over the tool-wide default,
+  # which is the fallback for every result that does not name one.
+  effective_scheduling = (
+      scheduling_override
+      if scheduling_override is not None
+      else tool.response_scheduling
+  )
+  if effective_scheduling is not None:
+    function_response.scheduling = effective_scheduling
 
   return types.Content(role='user', parts=[part_function_response])
 

@@ -17,7 +17,9 @@ from datetime import datetime
 import importlib
 import json
 import os
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import traceback
@@ -40,6 +42,109 @@ _LOCAL_STORAGE_FLAG_MIN_VERSION: Final[str] = '1.21.0'
 _AGENT_ENGINE_REQUIREMENT: Final[str] = (
     'google-cloud-aiplatform[adk,agent_engines]'
 )
+# Full Cloud Build private worker pool resource name, e.g.
+# projects/my-project/locations/us-central1/workerPools/my-private-pool
+_WORKER_POOL_RESOURCE_RE: Final[re.Pattern[str]] = re.compile(
+    r'^projects/[^/]+/locations/[^/]+/workerPools/[^/]+$'
+)
+
+
+def _validate_worker_pool(worker_pool: str) -> str:
+  """Validates a Cloud Build worker pool resource name.
+
+  Args:
+    worker_pool: Full resource name of the form
+      `projects/{project}/locations/{location}/workerPools/{pool}`.
+
+  Returns:
+    The validated worker pool resource name.
+
+  Raises:
+    click.ClickException: If the resource name is empty or malformed.
+  """
+  worker_pool = worker_pool.strip()
+  if not worker_pool:
+    raise click.ClickException('worker_pool must be a non-empty resource name.')
+  if not _WORKER_POOL_RESOURCE_RE.fullmatch(worker_pool):
+    raise click.ClickException(
+        'Invalid worker_pool resource name. Expected format:'
+        ' projects/{project}/locations/{location}/workerPools/{pool}.'
+        f' Got: {worker_pool}'
+    )
+  return worker_pool
+
+
+def _apply_worker_pool_to_agent_config(
+    agent_config: dict[str, Any],
+    worker_pool: Optional[str],
+) -> None:
+  """Nests worker_pool into agent_config['build_config'].
+
+  Supports three sources, in increasing precedence:
+
+  1. Existing ``build_config.worker_pool`` already in ``agent_config``.
+  2. Top-level ``worker_pool`` convenience key in ``.agent_engine_config.json``
+     (popped so it is not forwarded as an unknown top-level field).
+  3. Explicit ``worker_pool`` argument (CLI flag), which overrides both.
+
+  The Vertex Agent Engine SDK reads Cloud Build private pools from
+  ``config.build_config.worker_pool`` and maps them onto
+  ``spec.build_spec.worker_pool``.
+  """
+  build_config = agent_config.get('build_config')
+  if build_config is None:
+    build_config = {}
+  elif not isinstance(build_config, dict):
+    raise click.ClickException(
+        'build_config in agent platform config must be a JSON object.'
+    )
+  else:
+    # Copy so we do not mutate a shared structure unexpectedly.
+    build_config = dict(build_config)
+
+  config_worker_pool = agent_config.pop('worker_pool', None)
+  if config_worker_pool is not None:
+    if not isinstance(config_worker_pool, str):
+      raise click.ClickException(
+          'worker_pool in agent platform config must be a string resource name.'
+      )
+    build_config['worker_pool'] = _validate_worker_pool(config_worker_pool)
+
+  if worker_pool is not None:
+    if build_config.get('worker_pool'):
+      click.echo(
+          'Overriding build_config.worker_pool in agent platform config with'
+          f' {worker_pool}'
+      )
+    build_config['worker_pool'] = _validate_worker_pool(worker_pool)
+
+  # Validate any worker_pool that was already nested under build_config.
+  if 'worker_pool' in build_config and build_config['worker_pool'] is not None:
+    build_config['worker_pool'] = _validate_worker_pool(
+        str(build_config['worker_pool'])
+    )
+
+  if build_config:
+    agent_config['build_config'] = build_config
+  else:
+    agent_config.pop('build_config', None)
+
+
+def _on_rm_error(func: Callable[..., Any], path: str, exc_info: Any) -> None:
+  """Error handler for shutil.rmtree to handle read-only files on Windows."""
+  os.chmod(path, stat.S_IWRITE)
+  func(path)
+
+
+def _robust_rmtree(path: str) -> None:
+  """Remove a directory tree, handling read-only files on Windows."""
+  if _IS_WINDOWS:
+    if sys.version_info >= (3, 12):
+      shutil.rmtree(path, onexc=lambda fn, p, exc: _on_rm_error(fn, p, None))
+    else:
+      shutil.rmtree(path, onerror=_on_rm_error)
+  else:
+    shutil.rmtree(path)
 
 
 def _ensure_agent_engine_dependency(requirements_txt_path: str) -> None:
@@ -90,6 +195,8 @@ ENV GOOGLE_CLOUD_LOCATION={gcp_region}
 
 # Install ADK - Start
 RUN pip install "google-adk[a2a]=={adk_version}"
+# Remove dev_server.py to ensure production-safe endpoints only (disabling dev endpoints in production)
+RUN python -c "import os, glob, google.adk.cli as cli; d = os.path.dirname(cli.__file__); [os.remove(f) for f in glob.glob(os.path.join(d, 'dev_server*'))]; [os.remove(f) for f in glob.glob(os.path.join(d, '__pycache__', 'dev_server*'))]" || true
 # Install ADK - End
 
 # Copy agent - Start
@@ -715,7 +822,7 @@ def to_cloud_run(
   # remove temp_folder if exists
   if os.path.exists(temp_folder):
     click.echo('Removing existing files')
-    shutil.rmtree(temp_folder)
+    _robust_rmtree(temp_folder)
 
   try:
     # copy agent source code
@@ -837,7 +944,7 @@ def to_cloud_run(
     subprocess.run(gcloud_cmd, check=True)
   finally:
     click.echo(f'Cleaning up the temp folder: {temp_folder}')
-    shutil.rmtree(temp_folder)
+    _robust_rmtree(temp_folder)
 
 
 def _print_agent_engine_url(resource_name: str) -> None:
@@ -856,6 +963,15 @@ def _print_agent_engine_url(resource_name: str) -> None:
     click.secho(
         f'\n🎉 View your deployed agent here:\n{url}\n', fg='cyan', bold=True
     )
+
+
+def _print_gemini_enterprise_hint() -> None:
+  """Prints a pointer to the Gemini Enterprise registration docs."""
+  click.secho(
+      'To make this agent available in Gemini Enterprise, register it by'
+      ' following:\nhttps://docs.cloud.google.com/gemini/enterprise/docs/register-and-manage-an-adk-agent\n',
+      fg='cyan',
+  )
 
 
 def to_agent_engine(
@@ -884,6 +1000,7 @@ def to_agent_engine(
     artifact_service_uri: Optional[str] = None,
     adk_version: Optional[str] = None,
     extra_packages: Optional[list[str]] = None,
+    worker_pool: Optional[str] = None,
 ) -> None:
   """Deploys an agent to Gemini Enterprise Agent Platform.
 
@@ -950,6 +1067,13 @@ def to_agent_engine(
       used.
     extra_packages (list[str]): Optional. Additional local file or directory
       paths to stage alongside the agent and make importable in the image.
+    worker_pool (str): Optional. Full Cloud Build private worker pool resource
+      name
+      (`projects/{project}/locations/{location}/workerPools/{pool}`).
+      When set, Agent Engine builds the container image on that pool so
+      deploys can reach private networks / comply with org build policies.
+      Overrides `worker_pool` / `build_config.worker_pool` from
+      `.agent_engine_config.json` when both are present.
   """
   app_name = os.path.basename(agent_folder)
   display_name = display_name or app_name
@@ -995,7 +1119,7 @@ def to_agent_engine(
   temp_folder_path = os.path.join(parent_folder, temp_folder)
   if os.path.exists(temp_folder_path):
     click.echo('Removing existing files')
-    shutil.rmtree(temp_folder_path)
+    _robust_rmtree(temp_folder_path)
 
   try:
     ignore_func = _get_ignore_patterns_func(agent_folder)
@@ -1046,6 +1170,8 @@ def to_agent_engine(
             f' {description}'
         )
       agent_config['description'] = description
+
+    _apply_worker_pool_to_agent_config(agent_config, worker_pool)
 
     config_extra_packages = agent_config.pop('extra_packages', None) or []
     # CLI entries resolve against the invocation dir; config-file entries
@@ -1302,11 +1428,12 @@ def to_agent_engine(
         click.secho(f'Cleaned up the instance: {resource_name}', fg='green')
       raise e
     _print_agent_engine_url(resource_name)
+    _print_gemini_enterprise_hint()
   finally:
     temp_folder_path = os.path.join(parent_folder, temp_folder)
     click.echo(f'Cleaning up the temp folder: {temp_folder_path}')
     os.chdir(original_cwd)
-    shutil.rmtree(temp_folder_path)
+    _robust_rmtree(temp_folder_path)
 
 
 def to_gke(
@@ -1385,7 +1512,7 @@ def to_gke(
   # remove temp_folder if exists
   if os.path.exists(temp_folder):
     click.echo('  - Removing existing temporary directory...')
-    shutil.rmtree(temp_folder)
+    _robust_rmtree(temp_folder)
 
   try:
     # copy agent source code
@@ -1456,7 +1583,7 @@ def to_gke(
     image_name = f'gcr.io/{project}/{service_name}'
     subprocess.run(
         [
-            'gcloud',
+            _GCLOUD_CMD,
             'builds',
             'submit',
             '--tag',
@@ -1526,7 +1653,7 @@ spec:
     click.echo('  - Getting cluster credentials...')
     subprocess.run(
         [
-            'gcloud',
+            _GCLOUD_CMD,
             'container',
             'clusters',
             'get-credentials',
@@ -1556,7 +1683,7 @@ spec:
   finally:
     click.secho('\nSTEP 5: Cleaning up...', bold=True)
     click.echo(f'  - Removing temporary directory: {temp_folder}')
-    shutil.rmtree(temp_folder)
+    _robust_rmtree(temp_folder)
   click.secho(
       '\n🎉 Deployment to GKE finished successfully!', fg='cyan', bold=True
   )

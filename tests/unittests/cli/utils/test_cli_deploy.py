@@ -250,6 +250,19 @@ def test_print_agent_engine_url() -> None:
     assert "playground" in call_args
 
 
+def test_print_gemini_enterprise_hint() -> None:
+  """It should print a pointer to the Gemini Enterprise registration docs."""
+  with mock.patch("click.secho") as mocked_secho:
+    cli_deploy._print_gemini_enterprise_hint()
+    mocked_secho.assert_called_once()
+    call_args = mocked_secho.call_args[0][0]
+    assert "Gemini Enterprise" in call_args
+    assert (
+        "https://docs.cloud.google.com/gemini/enterprise/docs/register-and-manage-an-adk-agent"
+        in call_args
+    )
+
+
 @pytest.mark.parametrize("include_requirements", [True, False])
 def test_to_agent_engine_happy_path(
     monkeypatch: pytest.MonkeyPatch,
@@ -393,7 +406,7 @@ def test_to_gke_happy_path(
 
   build_args = run_recorder.calls[0][0][0]
   expected_build_args = [
-      "gcloud",
+      cli_deploy._GCLOUD_CMD,
       "builds",
       "submit",
       "--tag",
@@ -406,7 +419,7 @@ def test_to_gke_happy_path(
 
   creds_args = run_recorder.calls[1][0][0]
   expected_creds_args = [
-      "gcloud",
+      cli_deploy._GCLOUD_CMD,
       "container",
       "clusters",
       "get-credentials",
@@ -441,6 +454,57 @@ def test_to_gke_happy_path(
 
   # 4. Verify cleanup
   assert str(rmtree_recorder.get_last_call_args()[0]) == str(tmp_path)
+
+
+def test_to_gke_uses_gcloud_cmd_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_dir: Callable[[bool, bool], Path],
+    tmp_path: Path,
+) -> None:
+  """On Windows, `to_gke` must invoke gcloud via `_GCLOUD_CMD` (gcloud.cmd).
+
+  Regression test: the GKE deploy path spawns gcloud without a shell, so a bare
+  `gcloud` name is not resolved to the `gcloud.cmd` batch script on Windows and
+  the deploy fails. Both gcloud invocations must use `_GCLOUD_CMD`.
+  """
+  src_dir = agent_dir(False, False)
+  run_recorder = _Recorder()
+
+  monkeypatch.setattr(cli_deploy, "_GCLOUD_CMD", "gcloud.cmd")
+
+  def mock_subprocess_run(*args, **kwargs):
+    run_recorder(*args, **kwargs)
+    command_list = args[0]
+    if command_list and command_list[0:2] == ["kubectl", "apply"]:
+      return types.SimpleNamespace(stdout="deployment created\nservice created")
+    return None
+
+  monkeypatch.setattr(subprocess, "run", mock_subprocess_run)
+  monkeypatch.setattr(shutil, "rmtree", _Recorder())
+
+  cli_deploy.to_gke(
+      agent_folder=str(src_dir),
+      project="gke-proj",
+      region="us-east1",
+      cluster_name="my-gke-cluster",
+      service_name="gke-svc",
+      app_name="agent",
+      temp_folder=str(tmp_path),
+      port=9090,
+      trace_to_cloud=False,
+      otel_to_cloud=False,
+      with_ui=False,
+      log_level="debug",
+      adk_version="1.2.0",
+  )
+
+  build_args = run_recorder.calls[0][0][0]
+  assert build_args[0] == "gcloud.cmd"
+  assert build_args[1:3] == ["builds", "submit"]
+
+  creds_args = run_recorder.calls[1][0][0]
+  assert creds_args[0] == "gcloud.cmd"
+  assert creds_args[1:4] == ["container", "clusters", "get-credentials"]
 
 
 # _validate_agent_import tests
@@ -1113,3 +1177,220 @@ def test_to_agent_engine_extra_packages_requirements_txt_is_not_clobbered(
   assert (tmp_dir / "requirements.txt").read_text() == (
       "some-unrelated-package\n"
   )
+
+
+# _robust_rmtree / _on_rm_error tests
+
+
+class TestRobustRmtree:
+  """Tests for the _robust_rmtree helper."""
+
+  def test_removes_directory_tree(self, tmp_path: Path) -> None:
+    """It should remove a normal directory tree."""
+    d = tmp_path / "subdir"
+    d.mkdir()
+    (d / "file.txt").write_text("hello")
+    cli_deploy._robust_rmtree(str(d))
+    assert not d.exists()
+
+  def test_removes_readonly_files(self, tmp_path: Path) -> None:
+    """It should remove a tree containing read-only files."""
+    import os
+    import stat
+
+    d = tmp_path / "ro_dir"
+    d.mkdir()
+    ro_file = d / "readonly.txt"
+    ro_file.write_text("locked")
+    ro_file.chmod(stat.S_IREAD)
+    cli_deploy._robust_rmtree(str(d))
+    assert not d.exists()
+
+  def test_on_rm_error_clears_readonly_and_retries(
+      self, tmp_path: Path
+  ) -> None:
+    """_on_rm_error should chmod the file and call the removal function."""
+    import os
+    import stat
+
+    ro_file = tmp_path / "locked.txt"
+    ro_file.write_text("data")
+    ro_file.chmod(stat.S_IREAD)
+
+    cli_deploy._on_rm_error(os.remove, str(ro_file), None)
+    assert not ro_file.exists()
+
+
+_VALID_WORKER_POOL = (
+    "projects/my-gcp-project/locations/us-central1/workerPools/my-private-pool"
+)
+
+
+def test_validate_worker_pool_accepts_full_resource_name() -> None:
+  """A well-formed Cloud Build worker pool resource name is accepted."""
+  assert cli_deploy._validate_worker_pool(_VALID_WORKER_POOL) == (
+      _VALID_WORKER_POOL
+  )
+
+
+@pytest.mark.parametrize(
+    "bad_pool",
+    [
+        "",
+        "   ",
+        "my-private-pool",
+        "projects/p/locations/l/workerPools/",
+        "projects/p/locations/l/pools/my-pool",
+        "projects/p/workerPools/my-pool",
+    ],
+)
+def test_validate_worker_pool_rejects_malformed_names(bad_pool: str) -> None:
+  """Malformed worker pool resource names raise a clear ClickException."""
+  with pytest.raises(click.ClickException):
+    cli_deploy._validate_worker_pool(bad_pool)
+
+
+def test_apply_worker_pool_nests_cli_value_into_build_config() -> None:
+  """CLI worker_pool is nested under build_config for the Vertex SDK."""
+  agent_config: Dict[str, Any] = {}
+  cli_deploy._apply_worker_pool_to_agent_config(
+      agent_config, _VALID_WORKER_POOL
+  )
+  assert agent_config["build_config"]["worker_pool"] == _VALID_WORKER_POOL
+  assert "worker_pool" not in agent_config
+
+
+def test_apply_worker_pool_pops_top_level_config_key() -> None:
+  """Top-level worker_pool in .agent_engine_config.json is nested and removed."""
+  agent_config: Dict[str, Any] = {"worker_pool": _VALID_WORKER_POOL}
+  cli_deploy._apply_worker_pool_to_agent_config(agent_config, None)
+  assert agent_config["build_config"]["worker_pool"] == _VALID_WORKER_POOL
+  assert "worker_pool" not in agent_config
+
+
+def test_apply_worker_pool_cli_overrides_config_file() -> None:
+  """Explicit CLI worker_pool overrides values from the config file."""
+  override = "projects/other/locations/europe-west1/workerPools/compliance-pool"
+  agent_config: Dict[str, Any] = {
+      "build_config": {"worker_pool": _VALID_WORKER_POOL},
+  }
+  cli_deploy._apply_worker_pool_to_agent_config(agent_config, override)
+  assert agent_config["build_config"]["worker_pool"] == override
+
+
+def test_apply_worker_pool_preserves_other_build_config_fields() -> None:
+  """Existing build_config.service_account is kept when adding worker_pool."""
+  agent_config: Dict[str, Any] = {
+      "build_config": {
+          "service_account": "builder@example.iam.gserviceaccount.com",
+      },
+  }
+  cli_deploy._apply_worker_pool_to_agent_config(
+      agent_config, _VALID_WORKER_POOL
+  )
+  assert agent_config["build_config"] == {
+      "service_account": "builder@example.iam.gserviceaccount.com",
+      "worker_pool": _VALID_WORKER_POOL,
+  }
+
+
+def test_to_agent_engine_forwards_worker_pool_in_update_config(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_dir: Callable[[bool, bool], Path],
+) -> None:
+  """to_agent_engine puts worker_pool under build_config on agent_engines.update."""
+  monkeypatch.setattr(shutil, "rmtree", _Recorder())
+  captured: List[Dict[str, Any]] = []
+  monkeypatch.setitem(
+      sys.modules, "vertexai", _make_recording_vertexai(captured)
+  )
+  src_dir = agent_dir(False, False)
+
+  cli_deploy.to_agent_engine(
+      agent_folder=str(src_dir),
+      temp_folder="tmp",
+      project="my-gcp-project",
+      region="us-central1",
+      adk_version="1.2.0",
+      worker_pool=_VALID_WORKER_POOL,
+  )
+
+  assert len(captured) == 1
+  assert captured[0]["build_config"]["worker_pool"] == _VALID_WORKER_POOL
+
+
+def test_to_agent_engine_reads_worker_pool_from_config_file(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_dir: Callable[[bool, bool], Path],
+) -> None:
+  """worker_pool from .agent_engine_config.json is forwarded on deploy."""
+  monkeypatch.setattr(shutil, "rmtree", _Recorder())
+  captured: List[Dict[str, Any]] = []
+  monkeypatch.setitem(
+      sys.modules, "vertexai", _make_recording_vertexai(captured)
+  )
+  src_dir = agent_dir(False, False)
+  (src_dir / ".agent_engine_config.json").write_text(
+      json.dumps({"worker_pool": _VALID_WORKER_POOL})
+  )
+
+  cli_deploy.to_agent_engine(
+      agent_folder=str(src_dir),
+      temp_folder="tmp",
+      project="my-gcp-project",
+      region="us-central1",
+      adk_version="1.2.0",
+  )
+
+  assert captured[0]["build_config"]["worker_pool"] == _VALID_WORKER_POOL
+  assert "worker_pool" not in captured[0]
+
+
+def test_to_agent_engine_rejects_invalid_worker_pool(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_dir: Callable[[bool, bool], Path],
+) -> None:
+  """An invalid --worker_pool value fails before calling Agent Engine APIs."""
+  monkeypatch.setattr(shutil, "rmtree", _Recorder())
+  captured: List[Dict[str, Any]] = []
+  monkeypatch.setitem(
+      sys.modules, "vertexai", _make_recording_vertexai(captured)
+  )
+  src_dir = agent_dir(False, False)
+
+  with pytest.raises(click.ClickException) as exc_info:
+    cli_deploy.to_agent_engine(
+        agent_folder=str(src_dir),
+        temp_folder="tmp",
+        project="my-gcp-project",
+        region="us-central1",
+        adk_version="1.2.0",
+        worker_pool="not-a-resource-name",
+    )
+
+  assert "Invalid worker_pool" in str(exc_info.value)
+  assert captured == []
+
+
+def test_cli_deploy_agent_engine_passes_worker_pool(tmp_path: Path) -> None:
+  """--worker_pool reaches to_agent_engine as a keyword argument."""
+  agent_dir = tmp_path / "my_agent"
+  agent_dir.mkdir()
+  runner = CliRunner()
+  with mock.patch(
+      "src.google.adk.cli.cli_deploy.to_agent_engine"
+  ) as mock_to_agent_engine:
+    result = runner.invoke(
+        cli_tools_click.main,
+        [
+            "deploy",
+            "agent_engine",
+            f"--worker_pool={_VALID_WORKER_POOL}",
+            str(agent_dir),
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    mock_to_agent_engine.assert_called_once()
+    _, kwargs = mock_to_agent_engine.call_args
+    assert kwargs["worker_pool"] == _VALID_WORKER_POOL

@@ -276,6 +276,10 @@ def _warn_if_with_ui(with_ui: bool) -> None:
 class TelemetryGroup(click.Group):
   """Custom Click Group to wrap execution for telemetry tracking."""
 
+  def main(self, *args, **kwargs):
+    kwargs.setdefault("windows_expand_args", False)
+    return super().main(*args, **kwargs)
+
   def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
     ctx.telemetry_args = list(args)  # type: ignore[attr-defined]
     return super().parse_args(ctx, args)
@@ -345,6 +349,7 @@ class TelemetryGroup(click.Group):
                   exit_code=exit_code,
                   duration_ms=int((time.monotonic() - start_time) * 1000),
                   exception_type=exception_type,
+                  express_mode_action=ctx.meta.get("express_mode_action", ""),
               )
         except Exception:  # pylint: disable=broad-except
           # Failsafe: telemetry errors must never crash the CLI
@@ -1100,6 +1105,33 @@ def eval_options():
   return decorator
 
 
+def _resolve_eval_config_file_path(
+    config_file_path: Optional[str],
+    eval_set_file_or_id_to_evals: dict[str, list[str]],
+) -> Optional[str]:
+  """Returns config file path for eval command.
+
+  If `config_file_path` is provided, it is used as-is. If omitted and evals are
+  loaded from a single file, this returns
+  `<eval_set_file_dir>/test_config.json`. Otherwise, returns None.
+  """
+  if config_file_path:
+    return config_file_path
+
+  if not eval_set_file_or_id_to_evals:
+    return None
+
+  if len(eval_set_file_or_id_to_evals) != 1:
+    return None
+
+  first_eval_set = next(iter(eval_set_file_or_id_to_evals))
+  if os.path.exists(first_eval_set):
+    eval_set_dir = os.path.dirname(first_eval_set)
+    return os.path.join(eval_set_dir, "test_config.json")
+
+  return None
+
+
 @main.command("eval", cls=HelpfulCommand)
 @feature_options()
 @click.argument(
@@ -1206,20 +1238,6 @@ def cli_eval(
   except ModuleNotFoundError as mnf:
     raise click.ClickException(_missing_eval_dependencies_message()) from mnf
 
-  eval_config = get_evaluation_criteria_or_default(config_file_path)
-  print(f"Using evaluation criteria: {eval_config}")
-  eval_metrics = get_eval_metrics_from_config(eval_config)
-
-  # Live mode is resolved from the eval config, consistent with how
-  # `user_simulator_config` and other eval settings are sourced.
-  if eval_config.live_model_config:
-    inference_config = InferenceConfig(
-        use_live=True,
-        live_timeout_seconds=eval_config.live_model_config.timeout_seconds,
-    )
-  else:
-    inference_config = InferenceConfig(use_live=False)
-
   app, root_agent = asyncio.run(get_app_or_root_agent(agent_module_file_path))
   app_name = os.path.basename(agent_module_file_path)
   agents_dir = os.path.dirname(agent_module_file_path)
@@ -1241,6 +1259,23 @@ def cli_eval(
   eval_set_file_or_id_to_evals = parse_and_get_evals_to_run(
       eval_set_file_path_or_id
   )
+  resolved_config_file_path = _resolve_eval_config_file_path(
+      config_file_path=config_file_path,
+      eval_set_file_or_id_to_evals=eval_set_file_or_id_to_evals,
+  )
+  eval_config = get_evaluation_criteria_or_default(resolved_config_file_path)
+  print(f"Using evaluation criteria: {eval_config}")
+  eval_metrics = get_eval_metrics_from_config(eval_config)
+
+  # Live mode is resolved from the eval config, consistent with how
+  # `user_simulator_config` and other eval settings are sourced.
+  if eval_config.live_model_config:
+    inference_config = InferenceConfig(
+        use_live=True,
+        live_timeout_seconds=eval_config.live_model_config.timeout_seconds,
+    )
+  else:
+    inference_config = InferenceConfig(use_live=False)
 
   # Check if the first entry is a file that exists, if it does then we assume
   # rest of the entries are also files. We enforce this assumption in the if
@@ -2038,6 +2073,7 @@ def cli_web(
       lifespan=_lifespan,
       a2a=a2a,
       host=host,
+      bind_host=host,
       port=port,
       url_prefix=url_prefix,
       reload_agents=reload_agents,
@@ -2178,6 +2214,7 @@ def cli_api_server(
           otel_to_cloud=otel_to_cloud,
           a2a=a2a,
           host=host,
+          bind_host=host,
           port=port,
           url_prefix=url_prefix,
           reload_agents=reload_agents,
@@ -2671,6 +2708,19 @@ def cli_migrate_session(
         " Repeatable."
     ),
 )
+@click.option(
+    "--worker_pool",
+    type=str,
+    default=None,
+    help=(
+        "Optional. Cloud Build private worker pool resource name used to build"
+        " the Agent Engine container image. Format:"
+        " projects/{project}/locations/{location}/workerPools/{pool}."
+        " Required for VPC-SC / private-network environments that cannot use"
+        " the default public Cloud Build pool. Overrides `worker_pool` or"
+        " `build_config.worker_pool` in `.agent_engine_config.json`."
+    ),
+)
 @adk_services_options(default_use_local_storage=False)
 @click.argument(
     "agent",
@@ -2705,6 +2755,7 @@ def cli_deploy_agent_engine(
     session_service_uri: str | None = None,
     use_local_storage: bool = False,
     extra_packages: tuple[str, ...] = (),
+    worker_pool: str | None = None,
 ):
   """Deploys an agent to Agent Engine.
 
@@ -2718,6 +2769,12 @@ def cli_deploy_agent_engine(
     # With Google Cloud Project and Region
     adk deploy agent_engine --project=[project] --region=[region]
       --display_name=[app_name] my_agent
+
+    \b
+    # With a private Cloud Build worker pool (VPC-SC / private network)
+    adk deploy agent_engine --project=[project] --region=[region]
+      --worker_pool=projects/[project]/locations/[region]/workerPools/[pool]
+      my_agent
   """
   logging.getLogger("vertexai_genai.agentengines").setLevel(logging.INFO)
   try:
@@ -2752,6 +2809,7 @@ def cli_deploy_agent_engine(
         session_service_uri=session_service_uri,
         adk_version=adk_version,
         extra_packages=list(extra_packages),
+        worker_pool=worker_pool,
     )
   except Exception as e:
     click.secho(f"Deploy failed: {e}", fg="red", err=True)
