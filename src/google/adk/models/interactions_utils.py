@@ -101,6 +101,7 @@ if TYPE_CHECKING:
   from ..tools._remote_mcp_server import RemoteMcpServer
 
 from ..utils._google_client_headers import merge_tracking_headers
+from ._service_tier import ServiceTier
 from .llm_request import LlmRequest
 from .llm_response import LlmResponse
 
@@ -1688,6 +1689,8 @@ async def generate_content_via_interactions(
     api_client: Client,
     llm_request: LlmRequest,
     stream: bool,
+    *,
+    service_tier: ServiceTier | str | None = None,
 ) -> AsyncGenerator[LlmResponse, None]:
   """Generate content using the interactions API.
 
@@ -1702,10 +1705,22 @@ async def generate_content_via_interactions(
     api_client: The Google GenAI client.
     llm_request: The LLM request to send.
     stream: Whether to stream the response.
+    service_tier: Optional serving tier. ``deferred`` queues the request to run
+      on off-peak capacity and cannot be combined with streaming.
 
   Yields:
     LlmResponse objects converted from interaction responses.
+
+  Raises:
+    ValueError: If ``deferred`` is combined with streaming.
   """
+  if service_tier == ServiceTier.DEFERRED and stream:
+    raise ValueError(
+        "service_tier='deferred' cannot be used with streaming. A deferred"
+        ' request is queued to run on off-peak capacity and returns an'
+        ' interaction id instead of a result, so there is nothing to stream.'
+        ' Use StreamingMode.NONE.'
+    )
 
   # When previous_interaction_id is set, only send the latest continuous
   # user messages (the current turn) instead of full conversation history
@@ -1755,6 +1770,14 @@ async def generate_content_via_interactions(
       'generation_config': generation_config if generation_config else None,
       'previous_interaction_id': previous_interaction_id,
   }
+
+  if service_tier:
+    create_kwargs['service_tier'] = service_tier
+    if service_tier == ServiceTier.DEFERRED:
+      # The API rejects deferred without this. 'store' is deliberately left
+      # unset: it already defaults on for a background call, and sending
+      # store=False is rejected outright.
+      create_kwargs['background'] = True
 
   # Re-merge tracking headers into any request-time headers (idempotent) so the
   # interactions path forwards user-supplied headers instead of dropping them.
