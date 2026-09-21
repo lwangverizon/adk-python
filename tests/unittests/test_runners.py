@@ -162,7 +162,6 @@ class MockPlugin(BasePlugin):
     super().__init__(name="mock_plugin")
     self.enable_user_message_callback = False
     self.enable_event_callback = False
-    self.before_run_response: Optional[types.Content] = None
     self.user_content_seen_in_before_run_callback = None
 
   async def on_user_message_callback(
@@ -182,11 +181,10 @@ class MockPlugin(BasePlugin):
       self,
       *,
       invocation_context: InvocationContext,
-  ) -> Optional[types.Content]:
+  ) -> None:
     self.user_content_seen_in_before_run_callback = (
         invocation_context.user_content
     )
-    return self.before_run_response
 
   async def on_event_callback(
       self, *, invocation_context: InvocationContext, event: Event
@@ -235,6 +233,19 @@ def test_find_agent_to_run_forwards_to_agent_router():
 
   result = runner._find_agent_to_run(session, root_agent)
   assert result == sub_agent
+
+
+def test_is_transferable_across_agent_tree_forwards_to_agent_router():
+  """Runner._is_transferable_across_agent_tree forwards to _agent_router."""
+  root_agent = MockLlmAgent("root_agent")
+  sub_agent = MockLlmAgent("sub_agent", parent_agent=root_agent)
+  runner = Runner(
+      app_name="test_app",
+      agent=root_agent,
+      session_service=InMemorySessionService(),
+  )
+
+  assert runner._is_transferable_across_agent_tree(sub_agent) is True
 
 
 def test_find_agent_to_run_ignores_rewound_sub_agent_event():
@@ -1437,68 +1448,6 @@ class TestRunnerWithPlugins:
     )
 
   @pytest.mark.asyncio
-  @pytest.mark.parametrize(
-      ("agent_cls", "is_live"),
-      [
-          (MockAgent, False),
-          (MockLlmAgent, False),
-          (MockLiveAgent, True),
-      ],
-      ids=("legacy", "node", "live"),
-  )
-  async def test_runner_processes_before_run_early_exit_with_event_callback(
-      self, agent_cls, is_live
-  ):
-    """Before-run early exits still pass through on-event hooks."""
-    from google.adk.live import LiveRequestQueue
-
-    plugin = MockPlugin()
-    plugin.before_run_response = types.Content(
-        role="model", parts=[types.Part(text="blocked by before_run")]
-    )
-    plugin.enable_event_callback = True
-    session_service = InMemorySessionService()
-    runner = Runner(
-        app=App(
-            name=TEST_APP_ID,
-            root_agent=agent_cls("test_agent"),
-            plugins=[plugin],
-        ),
-        session_service=session_service,
-    )
-    session = await session_service.create_session(
-        app_name=TEST_APP_ID,
-        user_id=TEST_USER_ID,
-        session_id=TEST_SESSION_ID,
-    )
-
-    if is_live:
-      event_stream = runner.run_live(
-          user_id=TEST_USER_ID,
-          session_id=TEST_SESSION_ID,
-          live_request_queue=LiveRequestQueue(),
-      )
-    else:
-      event_stream = runner.run_async(
-          user_id=TEST_USER_ID,
-          session_id=TEST_SESSION_ID,
-          new_message=types.Content(
-              role="user", parts=[types.Part(text="hello")]
-          ),
-      )
-    events = [event async for event in event_stream]
-    persisted_session = await session_service.get_session(
-        app_name=TEST_APP_ID,
-        user_id=TEST_USER_ID,
-        session_id=session.id,
-    )
-
-    assert len(events) == 1
-    assert events[0].content.parts[0].text == MockPlugin.ON_EVENT_CALLBACK_MSG
-    assert events[0].custom_metadata == MockPlugin.ON_EVENT_CALLBACK_METADATA
-    assert persisted_session.events[-1] == events[0]
-
-  @pytest.mark.asyncio
   async def test_runner_close_calls_plugin_close(self):
     """Test that runner.close() calls plugin manager close."""
     # Mock the plugin manager's close method
@@ -1720,7 +1669,7 @@ class TestRunnerCacheConfig:
     assert invocation_context.context_cache_config.cache_intervals == 20
 
   def test_runner_validate_params_return_order(self):
-    """Test that _resolve_app resolves App fields accurately."""
+    """Test that _validate_runner_params returns values in correct order."""
     cache_config = ContextCacheConfig(cache_intervals=25)
 
     app = App(
@@ -1730,26 +1679,42 @@ class TestRunnerCacheConfig:
         resumability_config=ResumabilityConfig(is_resumable=True),
     )
 
-    resolved = Runner._resolve_app(app, None, None, None, None)
-
-    assert resolved.name == "order_test_app"
-    assert resolved.root_agent == self.root_agent
-    assert resolved.context_cache_config == cache_config
-    assert resolved.context_cache_config.cache_intervals == 25
-    assert resolved.resumability_config == app.resumability_config
-    assert resolved.plugins == []
-
-  def test_runner_validate_params_without_app(self):
-    """Test _resolve_app without App returns None for cache config."""
-    resolved = Runner._resolve_app(
-        None, "test_app", self.root_agent, None, None
+    runner = Runner(
+        app=app,
+        session_service=self.session_service,
+        artifact_service=self.artifact_service,
     )
 
-    assert resolved.name == "test_app"
-    assert resolved.root_agent == self.root_agent
-    assert resolved.context_cache_config is None
-    assert resolved.resumability_config is None
-    assert resolved.plugins == []
+    # Test the validation method directly
+    app_name, agent, context_cache_config, resumability_config, plugins = (
+        runner._validate_runner_params(app, None, None, None)
+    )
+
+    assert app_name == "order_test_app"
+    assert agent == self.root_agent
+    assert context_cache_config == cache_config
+    assert context_cache_config.cache_intervals == 25
+    assert resumability_config == app.resumability_config
+    assert plugins == []
+
+  def test_runner_validate_params_without_app(self):
+    """Test _validate_runner_params without App returns None for cache config."""
+    runner = Runner(
+        app_name="test_app",
+        agent=self.root_agent,
+        session_service=self.session_service,
+        artifact_service=self.artifact_service,
+    )
+
+    app_name, agent, context_cache_config, resumability_config, plugins = (
+        runner._validate_runner_params(None, "test_app", self.root_agent, None)
+    )
+
+    assert app_name == "test_app"
+    assert agent == self.root_agent
+    assert context_cache_config is None
+    assert resumability_config is None
+    assert plugins is None
 
   def test_runner_app_name_and_agent_extracted_correctly(self):
     """Test that app_name and agent are correctly extracted from App."""
@@ -3102,9 +3067,9 @@ async def test_append_user_event_leaves_root_context_branch_alone():
 
   # Stamping is what puts a child branch on the event; the root must not follow.
   with mock.patch.object(
-      runners,
-      "_stamp_event_branch_context",
-      lambda ic, event: setattr(event, "branch", "coordinator@1.tool@2"),
+      InvocationContext,
+      "stamp_event_branch_context",
+      lambda self, event: setattr(event, "branch", "coordinator@1.tool@2"),
   ):
     event = await runner._append_user_event(
         ic, types.Content(parts=[types.Part.from_text(text="hi")])
@@ -4053,300 +4018,6 @@ async def test_retry_is_deduplicated_even_when_a_plugin_rewrote_the_message():
   )
   assert len(_user_events_for(stored, "inv-retry")) == 1
   assert plugin.calls == 1
-
-
-@pytest.mark.asyncio
-async def test_run_async_early_close_executes_after_run_plugin():
-  """Closing runner.run_async early executes after_run callbacks."""
-  after_run_called = False
-
-  class _TestPlugin(BasePlugin):
-
-    async def after_run_callback(
-        self, *, invocation_context: InvocationContext
-    ) -> None:
-      nonlocal after_run_called
-      after_run_called = True
-
-  class EchoAgent(BaseAgent):
-
-    def __init__(self, name: str):
-      super().__init__(name=name, sub_agents=[])
-
-    async def _run_async_impl(
-        self, invocation_context: InvocationContext
-    ) -> AsyncGenerator[Event, None]:
-      yield Event(
-          invocation_id=invocation_context.invocation_id,
-          author=self.name,
-          content=types.Content(
-              role="model", parts=[types.Part(text="step 1")]
-          ),
-      )
-      yield Event(
-          invocation_id=invocation_context.invocation_id,
-          author=self.name,
-          content=types.Content(
-              role="model", parts=[types.Part(text="step 2")]
-          ),
-      )
-
-  app = App(
-      name="test_app",
-      root_agent=EchoAgent("echo"),
-      plugins=[_TestPlugin(name="test_plugin")],
-  )
-  ss = InMemorySessionService()
-  runner = Runner(app=app, session_service=ss)
-  session = await ss.create_session(app_name="test_app", user_id=TEST_USER_ID)
-
-  async with aclosing(
-      runner.run_async(
-          user_id=TEST_USER_ID,
-          session_id=session.id,
-          new_message=types.Content(parts=[types.Part(text="go")], role="user"),
-      )
-  ) as agen:
-    async for _ in agen:
-      break
-
-  assert after_run_called is True
-
-
-@pytest.mark.asyncio
-async def test_run_async_cancellation_does_not_execute_after_run_plugin():
-  """External task cancellation skips after_run callbacks."""
-  after_run_called = False
-
-  class _TestPlugin(BasePlugin):
-
-    async def after_run_callback(
-        self, *, invocation_context: InvocationContext
-    ) -> None:
-      nonlocal after_run_called
-      after_run_called = True
-
-  class WaitingAgent(BaseAgent):
-
-    def __init__(self, name: str):
-      super().__init__(name=name, sub_agents=[])
-
-    async def _run_async_impl(
-        self, invocation_context: InvocationContext
-    ) -> AsyncGenerator[Event, None]:
-      yield Event(
-          invocation_id=invocation_context.invocation_id,
-          author=self.name,
-          content=types.Content(
-              role="model", parts=[types.Part(text="started")]
-          ),
-      )
-      await asyncio.sleep(100)
-
-  app = App(
-      name="test_app",
-      root_agent=WaitingAgent("waiting"),
-      plugins=[_TestPlugin(name="test_plugin")],
-  )
-  ss = InMemorySessionService()
-  runner = Runner(app=app, session_service=ss)
-  session = await ss.create_session(app_name="test_app", user_id=TEST_USER_ID)
-
-  started_event = asyncio.Event()
-
-  async def consumer():
-    async for _ in runner.run_async(
-        user_id=TEST_USER_ID,
-        session_id=session.id,
-        new_message=types.Content(parts=[types.Part(text="go")], role="user"),
-    ):
-      started_event.set()
-
-  task = asyncio.create_task(consumer())
-  await started_event.wait()
-  task.cancel()
-  with pytest.raises(asyncio.CancelledError):
-    await task
-
-  assert after_run_called is False
-
-
-@pytest.mark.asyncio
-async def test_run_async_after_run_failure_on_early_close_does_not_escape():
-  """after_run failure on early close does not escape aclose()."""
-  reported_errors: list[Exception] = []
-
-  class _FailingAfterRunPlugin(BasePlugin):
-
-    async def after_run_callback(
-        self, *, invocation_context: InvocationContext
-    ) -> None:
-      raise ValueError("after_run boom")
-
-    async def on_run_error_callback(
-        self, *, invocation_context: InvocationContext, error: Exception
-    ) -> None:
-      reported_errors.append(error)
-
-  class EchoAgent(BaseAgent):
-
-    def __init__(self, name: str):
-      super().__init__(name=name, sub_agents=[])
-
-    async def _run_async_impl(
-        self, invocation_context: InvocationContext
-    ) -> AsyncGenerator[Event, None]:
-      yield Event(
-          invocation_id=invocation_context.invocation_id,
-          author=self.name,
-          content=types.Content(role="model", parts=[types.Part(text="one")]),
-      )
-      yield Event(
-          invocation_id=invocation_context.invocation_id,
-          author=self.name,
-          content=types.Content(role="model", parts=[types.Part(text="two")]),
-      )
-
-  app = App(
-      name="test_app",
-      root_agent=EchoAgent("echo"),
-      plugins=[_FailingAfterRunPlugin(name="failing_plugin")],
-  )
-  ss = InMemorySessionService()
-  runner = Runner(app=app, session_service=ss)
-  session = await ss.create_session(app_name="test_app", user_id=TEST_USER_ID)
-
-  # Failure is reported through on_run_error rather than escaping aclose().
-  async with aclosing(
-      runner.run_async(
-          user_id=TEST_USER_ID,
-          session_id=session.id,
-          new_message=types.Content(parts=[types.Part(text="go")], role="user"),
-      )
-  ) as agen:
-    async for _ in agen:
-      break
-
-  assert len(reported_errors) == 1
-
-
-def test_run_sync_early_break_executes_after_run_plugin():
-  """Breaking out of synchronous run() executes after_run callbacks."""
-  after_run_called = False
-
-  class _TestPlugin(BasePlugin):
-
-    async def after_run_callback(
-        self, *, invocation_context: InvocationContext
-    ) -> None:
-      nonlocal after_run_called
-      after_run_called = True
-
-  class _SteppingAgent(BaseAgent):
-
-    async def _run_async_impl(
-        self, invocation_context: InvocationContext
-    ) -> AsyncGenerator[Event, None]:
-      for i in range(5):
-        yield Event(
-            invocation_id=invocation_context.invocation_id,
-            author=self.name,
-            content=types.Content(
-                role="model", parts=[types.Part(text=f"step {i}")]
-            ),
-        )
-        await asyncio.sleep(0.05)
-
-  app = App(
-      name="test_app",
-      root_agent=_SteppingAgent(name="stepping"),
-      plugins=[_TestPlugin(name="test_plugin")],
-  )
-  runner = Runner(
-      app=app,
-      session_service=InMemorySessionService(),
-      auto_create_session=True,
-  )
-
-  consumed = 0
-  for _ in runner.run(
-      user_id=TEST_USER_ID,
-      session_id="session_sync_break",
-      new_message=types.Content(role="user", parts=[types.Part(text="go")]),
-  ):
-    consumed += 1
-    break
-
-  assert consumed == 1
-  assert after_run_called is True
-
-
-def test_stamp_event_branch_context_preserves_isolation_scope():
-  """Tests _stamp_event_branch_context does not overwrite existing isolation_scope with None."""
-  fc = types.Part.from_function_call(name="some_tool", args={})
-  fc.function_call.id = "test_function_call_id"
-  fc_event = Event(
-      invocation_id="inv_1",
-      author="agent",
-      branch="root@1",
-      isolation_scope=None,  # Coordinator FC has None scope
-      content=testing_utils.ModelContent([fc]),
-  )
-  fr = types.Part.from_function_response(
-      name="some_tool", response={"result": "ok"}
-  )
-  fr.function_response.id = "test_function_call_id"
-  fr_event = Event(
-      invocation_id="inv_1",
-      author="agent",
-      isolation_scope="task_123",  # Pre-populated active task scope
-      content=types.Content(role="user", parts=[fr]),
-  )
-  session = mock.Mock(spec=Session, events=[fc_event, fr_event])
-  ic = InvocationContext(
-      session_service=mock.Mock(spec=BaseSessionService),
-      agent=mock.Mock(spec=BaseAgent, name="agent"),
-      invocation_id="inv_1",
-      session=session,
-  )
-
-  runners._stamp_event_branch_context(ic, fr_event)
-  assert fr_event.branch == "root@1"
-  assert fr_event.isolation_scope == "task_123"
-
-
-def test_stamp_event_branch_context_does_not_overwrite_existing_scope():
-  """Tests _stamp_event_branch_context does not overwrite existing isolation_scope if set."""
-  fc = types.Part.from_function_call(name="some_tool", args={})
-  fc.function_call.id = "test_function_call_id"
-  fc_event = Event(
-      invocation_id="inv_1",
-      author="agent",
-      branch="root@1",
-      isolation_scope="task_456",  # Function call has isolation scope
-      content=testing_utils.ModelContent([fc]),
-  )
-  fr = types.Part.from_function_response(
-      name="some_tool", response={"result": "ok"}
-  )
-  fr.function_response.id = "test_function_call_id"
-  fr_event = Event(
-      invocation_id="inv_1",
-      author="agent",
-      isolation_scope="task_123",  # Pre-populated active task scope
-      content=types.Content(role="user", parts=[fr]),
-  )
-  session = mock.Mock(spec=Session, events=[fc_event, fr_event])
-  ic = InvocationContext(
-      session_service=mock.Mock(spec=BaseSessionService),
-      agent=mock.Mock(spec=BaseAgent, name="agent"),
-      invocation_id="inv_1",
-      session=session,
-  )
-
-  runners._stamp_event_branch_context(ic, fr_event)
-  assert fr_event.branch == "root@1"
-  assert fr_event.isolation_scope == "task_123"
 
 
 if __name__ == "__main__":

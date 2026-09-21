@@ -50,12 +50,7 @@ def migrate(source_db_url: str, dest_db_path: str) -> None:
     SourceSession = sessionmaker(bind=engine)
     source_session = SourceSession()
   except Exception as e:
-    # The parser quotes the rejected URL back, so report only the error type.
-    logger.error(
-        "Failed to connect to source database %s: %s",
-        _schema_check_utils._redact_db_url(source_db_url),
-        type(e).__name__,
-    )
+    logger.error(f"Failed to connect to source database: {e}")
     sys.exit(1)
 
   logger.info(f"Connecting to destination database: {dest_db_path}")

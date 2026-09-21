@@ -59,18 +59,6 @@ def _copy_session(session: Session) -> Session:
     return copy.deepcopy(session)
 
 
-def _copy_state(state: dict[str, Any]) -> dict[str, Any]:
-  """Copies state as deeply as _copy_session copies a session's own state.
-
-  Scoped state is no more reachable through the result than session state
-  is. Under IN_MEMORY_SESSION_SERVICE_LIGHT_COPY, values merged into a returned
-  session stay aliased to the service's scoped state, by design.
-  """
-  if is_feature_enabled(FeatureName.IN_MEMORY_SESSION_SERVICE_LIGHT_COPY):
-    return dict(state)
-  return copy.deepcopy(state)
-
-
 class InMemorySessionService(BaseSessionService):
   """An in-memory implementation of the session service.
 
@@ -237,8 +225,10 @@ class InMemorySessionService(BaseSessionService):
     """Merges app and user state into session state."""
     # Merge app state
     if app_name in self.app_state:
-      for key, value in _copy_state(self.app_state[app_name]).items():
-        copied_session.state[State.APP_PREFIX + key] = value
+      for key in self.app_state[app_name].keys():
+        copied_session.state[State.APP_PREFIX + key] = self.app_state[app_name][
+            key
+        ]
 
     if (
         app_name not in self.user_state
@@ -247,8 +237,10 @@ class InMemorySessionService(BaseSessionService):
       return copied_session
 
     # Merge session state with user state.
-    for key, value in _copy_state(self.user_state[app_name][user_id]).items():
-      copied_session.state[State.USER_PREFIX + key] = value
+    for key in self.user_state[app_name][user_id].keys():
+      copied_session.state[State.USER_PREFIX + key] = self.user_state[app_name][
+          user_id
+      ][key]
     return copied_session
 
   @override
@@ -326,8 +318,7 @@ class InMemorySessionService(BaseSessionService):
   async def get_user_state(
       self, *, app_name: str, user_id: str
   ) -> dict[str, Any]:
-    user_state = self.user_state.get(app_name, {}).get(user_id, {})
-    return _copy_state(user_state)
+    return dict(self.user_state.get(app_name, {}).get(user_id, {}))
 
   @override
   async def merge_state(

@@ -44,7 +44,6 @@ class FeatureName(str, Enum):
   EVENTARC_TOOL_CONFIG = "EVENTARC_TOOL_CONFIG"
   EVENTARC_TOOLSET = "EVENTARC_TOOLSET"
   FALLBACK_MODEL = "FALLBACK_MODEL"
-  FUNCTION_TOOL_ARG_VALIDATION = "FUNCTION_TOOL_ARG_VALIDATION"
   GCS_ADMIN_TOOLSET = "GCS_ADMIN_TOOLSET"
   GCS_TOOL_SETTINGS = "GCS_TOOL_SETTINGS"
   GCS_TOOLSET = "GCS_TOOLSET"
@@ -59,12 +58,9 @@ class FeatureName(str, Enum):
   # enum member by name. Keeping it private avoids a backward-compat
   # obligation for what is intended as a temporary, internal kill-switch.
   _MCP_GRACEFUL_ERROR_HANDLING = "MCP_GRACEFUL_ERROR_HANDLING"
-  MONGODB_TOOLSET = "MONGODB_TOOLSET"
-  MONGODB_TOOL_SETTINGS = "MONGODB_TOOL_SETTINGS"
   PROGRESSIVE_SSE_STREAMING = "PROGRESSIVE_SSE_STREAMING"
   PUBSUB_TOOL_CONFIG = "PUBSUB_TOOL_CONFIG"
   PUBSUB_TOOLSET = "PUBSUB_TOOLSET"
-  SKILL_LIFECYCLE = "SKILL_LIFECYCLE"
   SKILL_TOOLSET = "SKILL_TOOLSET"
   SPANNER_TOOLSET = "SPANNER_TOOLSET"
   SPANNER_ADMIN_TOOLSET = "SPANNER_ADMIN_TOOLSET"
@@ -161,9 +157,6 @@ _FEATURE_REGISTRY: dict[FeatureName, FeatureConfig] = {
     FeatureName.FALLBACK_MODEL: FeatureConfig(
         FeatureStage.EXPERIMENTAL, default_on=True
     ),
-    FeatureName.FUNCTION_TOOL_ARG_VALIDATION: FeatureConfig(
-        FeatureStage.EXPERIMENTAL, default_on=False
-    ),
     FeatureName.GCS_ADMIN_TOOLSET: FeatureConfig(
         FeatureStage.EXPERIMENTAL, default_on=True
     ),
@@ -191,12 +184,6 @@ _FEATURE_REGISTRY: dict[FeatureName, FeatureConfig] = {
     FeatureName._MCP_GRACEFUL_ERROR_HANDLING: FeatureConfig(
         FeatureStage.EXPERIMENTAL, default_on=True
     ),
-    FeatureName.MONGODB_TOOLSET: FeatureConfig(
-        FeatureStage.EXPERIMENTAL, default_on=True
-    ),
-    FeatureName.MONGODB_TOOL_SETTINGS: FeatureConfig(
-        FeatureStage.EXPERIMENTAL, default_on=True
-    ),
     FeatureName.PROGRESSIVE_SSE_STREAMING: FeatureConfig(
         FeatureStage.EXPERIMENTAL, default_on=True
     ),
@@ -205,9 +192,6 @@ _FEATURE_REGISTRY: dict[FeatureName, FeatureConfig] = {
     ),
     FeatureName.PUBSUB_TOOLSET: FeatureConfig(
         FeatureStage.EXPERIMENTAL, default_on=True
-    ),
-    FeatureName.SKILL_LIFECYCLE: FeatureConfig(
-        FeatureStage.EXPERIMENTAL, default_on=False
     ),
     FeatureName.SKILL_TOOLSET: FeatureConfig(
         FeatureStage.STABLE, default_on=True

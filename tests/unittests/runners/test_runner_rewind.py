@@ -76,8 +76,7 @@ class TestRunnerRewind:
     )
 
   @pytest.mark.asyncio
-  @pytest.mark.parametrize("initial_text", ["f1v0", ""])
-  async def test_rewind_async_with_state_and_artifacts(self, initial_text):
+  async def test_rewind_async_with_state_and_artifacts(self):
     """Tests rewind_async rewinds state and artifacts."""
     runner = self.runner
     user_id = "test_user"
@@ -94,7 +93,7 @@ class TestRunnerRewind:
         user_id=user_id,
         session_id=session_id,
         filename="f1",
-        artifact=types.Part.from_text(text=initial_text),
+        artifact=types.Part.from_text(text="f1v0"),
     )
     event1 = Event(
         invocation_id="invocation1",
@@ -178,7 +177,7 @@ class TestRunnerRewind:
         user_id=user_id,
         session_id=session_id,
         filename="f1",
-    ) == types.Part.from_text(text=initial_text)
+    ) == types.Part.from_text(text="f1v0")
     # f2 should not exist
     assert (
         await runner.artifact_service.load_artifact(

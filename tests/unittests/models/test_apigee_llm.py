@@ -826,8 +826,7 @@ async def test_streaming_chat_completions_malformed_tool_call_args_raises():
     yield (
         'data: {"choices": [{"delta": {"role": "assistant", "tool_calls":'
         ' [{"index": 0, "id": "call_1", "type": "function", "function":'
-        ' {"name": "test_func", "arguments": "{\\"a\\":"}}]}, "finish_reason":'
-        ' "tool_calls"}]}'
+        ' {"name": "test_func", "arguments": "{\\"a\\":"}}]}}]}'
     )
     yield 'data: [DONE]'
 

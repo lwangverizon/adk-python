@@ -28,7 +28,6 @@ from typing_extensions import override
 
 from ..agents.context import Context
 from ._base_node import BaseNode
-from ._errors import WorkflowConfigurationError
 from ._graph import NodeLike
 from ._retry_config import RetryConfig
 from .utils._workflow_graph_utils import build_node
@@ -63,9 +62,7 @@ class _ParallelWorker(BaseNode):
       timeout: float | None = None,
   ):
     if node == 'START':
-      raise WorkflowConfigurationError(
-          'ParallelWorker cannot wrap a START node.'
-      )
+      raise ValueError('ParallelWorker cannot wrap a START node.')
     built_node = build_node(node)
     super().__init__(
         name=built_node.name,
@@ -74,7 +71,7 @@ class _ParallelWorker(BaseNode):
         timeout=timeout,
     )
     if max_parallel_workers is not None and max_parallel_workers < 1:
-      raise WorkflowConfigurationError(
+      raise ValueError(
           'max_parallel_workers must be greater than or equal to 1.'
       )
     self._node = built_node

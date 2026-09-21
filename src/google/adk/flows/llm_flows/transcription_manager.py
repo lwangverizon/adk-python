@@ -21,14 +21,8 @@ existing imports working.
 
 from __future__ import annotations
 
-import warnings
+import logging
 
-from ...live._transcription_manager import logger as logger
 from ...live._transcription_manager import TranscriptionManager as TranscriptionManager
 
-warnings.warn(
-    'google.adk.flows.llm_flows.transcription_manager is deprecated; use'
-    ' google.adk.live._transcription_manager instead.',
-    DeprecationWarning,
-    stacklevel=2,
-)
+logger = logging.getLogger('google_adk.' + __name__)

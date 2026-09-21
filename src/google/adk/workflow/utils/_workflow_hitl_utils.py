@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+"""Utilities for ADK workflows."""
+
 from collections.abc import Mapping
 from typing import Any
 from typing import TYPE_CHECKING
@@ -30,7 +32,6 @@ from ...auth.auth_tool import AuthToolArguments
 from ...events.event import Event
 from ...events.request_input import RequestInput
 from ...utils._schema_utils import schema_to_json_schema
-from .._errors import WorkflowDataError
 
 if TYPE_CHECKING:
   from ...auth.auth_credential import AuthCredential
@@ -38,6 +39,9 @@ if TYPE_CHECKING:
 
 REQUEST_INPUT_FUNCTION_CALL_NAME = 'adk_request_input'
 REQUEST_CREDENTIAL_FUNCTION_CALL_NAME = 'adk_request_credential'
+
+_RESULT_KEY = 'result'
+"""Key used to wrap non-dict values in a FunctionResponse dict."""
 
 
 def create_request_input_event(request_input: RequestInput) -> Event:
@@ -284,8 +288,8 @@ async def process_auth_resume(
     interrupt_id: The interrupt ID of the auth request being resumed.
 
   Raises:
-    WorkflowDataError: If the response does not carry back the OAuth state that
-      was generated for this auth request.
+    ValueError: If the response does not carry back the OAuth state that was
+      generated for this auth request.
   """
   try:
     exchanged_credential = AuthConfig.model_validate(
@@ -300,7 +304,7 @@ async def process_auth_resume(
   if generated_state is not None:
     oauth2 = exchanged_credential.oauth2 if exchanged_credential else None
     if not oauth2 or oauth2.state != generated_state:
-      raise WorkflowDataError(
+      raise ValueError(
           'The auth response does not carry back the state generated for this'
           ' auth request. Return the auth config from the credential request'
           ' with the authorization result filled in.'

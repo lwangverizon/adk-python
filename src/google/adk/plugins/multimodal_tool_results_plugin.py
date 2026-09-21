@@ -21,7 +21,6 @@ from typing import Optional
 from google.genai import types
 
 from ..agents.callback_context import CallbackContext
-from ..flows.llm_flows.tools._caller import _as_function_response_part
 from ..models.llm_request import LlmRequest
 from ..models.llm_response import LlmResponse
 from ..tools.base_tool import BaseTool
@@ -45,19 +44,11 @@ _SESSION_UPDATED_KEY = (
 )
 
 
-def _is_carried_by_the_framework(value: object) -> bool:
-  """Returns whether the function response will carry this part itself."""
-  return _as_function_response_part(value) is not None
-
-
 class MultimodalToolResultsPlugin(BasePlugin):
-  """A plugin that lets a function tool return parts directly.
+  """A plugin that modifies function tool responses to support returning list of parts directly.
 
-  Under the default retention a part carrying media no longer needs this
-  plugin, because the framework moves it into the function response itself.
-  What is left here is everything that field cannot carry, such as a part
-  holding text, and this plugin should be removed once those are handled
-  directly too.
+  Should be removed in favor of directly supporting FunctionResponsePart when these
+  are supported outside of computer use tool.
   """
 
   def __init__(
@@ -98,9 +89,7 @@ class MultimodalToolResultsPlugin(BasePlugin):
   ) -> Optional[dict[str, Any]]:
     """Saves parts returned by the tool in ToolContext.
 
-    Later these are passed to LLM's context as-is. Under the default retention
-    a part the function response already carries is left out, so those bytes
-    are not sent a second time.
+    Later these are passed to LLM's context as-is.
     No-op if tool doesn't return list[google.genai.types.Part] or google.genai.types.Part.
     """
 
@@ -143,9 +132,6 @@ class MultimodalToolResultsPlugin(BasePlugin):
       else:
         tool_context.state[current_turn_key] = parts
     else:
-      parts = [part for part in parts if not _is_carried_by_the_framework(part)]
-      if not parts:
-        return None
       if PARTS_RETURNED_BY_TOOLS_ID in tool_context.state:
         tool_context.state[PARTS_RETURNED_BY_TOOLS_ID] += parts
       else:

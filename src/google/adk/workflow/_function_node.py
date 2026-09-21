@@ -36,8 +36,6 @@ from ..auth.auth_tool import AuthConfig
 from ..events.event import Event
 from ..events.request_input import RequestInput
 from ._base_node import BaseNode
-from ._errors import WorkflowConfigurationError
-from ._errors import WorkflowDataError
 from ._retry_config import RetryConfig
 from .utils._workflow_hitl_utils import create_auth_request_event
 from .utils._workflow_hitl_utils import has_auth_credential
@@ -134,9 +132,7 @@ class FunctionNode(BaseNode):
   _sig: inspect.Signature = PrivateAttr()
   _type_hints: dict[str, Any] = PrivateAttr()
   _type_adapters: dict[str, TypeAdapter[Any]] = PrivateAttr()
-  # Always assigned in __init__; 'ctx' is the fallback used when the wrapped
-  # function declares no context parameter.
-  _context_param_name: str = PrivateAttr(default="ctx")
+  _context_param_name: str | None = PrivateAttr(default=None)
 
   def __init__(
       self,
@@ -176,10 +172,10 @@ class FunctionNode(BaseNode):
     """
 
     if not callable(func):
-      raise WorkflowConfigurationError("Function must be callable.")
+      raise TypeError("Function must be callable.")
 
     if auth_config and not rerun_on_resume:
-      raise WorkflowConfigurationError(
+      raise ValueError(
           "FunctionNode with auth_config requires rerun_on_resume=True."
           " The node must rerun after credentials are provided."
       )
@@ -191,7 +187,7 @@ class FunctionNode(BaseNode):
         or getattr(spec.unwrapped_func, "__name__", None)
     )
     if not inferred_name:
-      raise WorkflowConfigurationError(
+      raise ValueError(
           "FunctionNode must have a name. If the wrapped callable does not"
           " have a '__name__' attribute, please provide a name explicitly."
       )
@@ -281,7 +277,9 @@ class FunctionNode(BaseNode):
     from ..tools._function_tool_declarations import _build_parameters_json_schema
     from ..tools._function_tool_declarations import _build_response_json_schema
 
-    ignore_params: list[str] = [self._context_param_name]
+    ignore_params: list[str] = (
+        [self._context_param_name] if self._context_param_name else []
+    )
     self.input_schema = _build_parameters_json_schema(
         func, ignore_params=ignore_params
     )
@@ -353,7 +351,7 @@ class FunctionNode(BaseNode):
       elif param.default is not inspect.Parameter.empty:
         kwargs[param_name] = param.default
       else:
-        raise WorkflowDataError(
+        raise ValueError(
             f'Missing value for parameter "{param_name}" of function'
             f' "{self.name}". It was not found in {source_name} and has no'
             " default value."
@@ -384,6 +382,8 @@ class FunctionNode(BaseNode):
       return None
 
     if isinstance(data, Event):
+      if data.output is not None:
+        data.output = self._validate_output_data(data.output)
       if state_delta:
         data.actions.state_delta.update(state_delta)
       return data
@@ -397,6 +397,8 @@ class FunctionNode(BaseNode):
 
     if isinstance(data, BaseModel):
       data = data.model_dump()
+
+    data = self._validate_output_data(data)
 
     return Event(
         output=data,

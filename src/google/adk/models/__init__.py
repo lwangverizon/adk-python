@@ -21,7 +21,6 @@ from typing import Any
 from typing import TYPE_CHECKING
 
 from ._capabilities import LlmCapabilities
-from ._service_tier import ServiceTier
 from .base_llm import BaseLlm
 from .llm_request import LlmRequest
 from .llm_response import LlmResponse
@@ -52,7 +51,6 @@ __all__ = [
     'LLMRegistry',
     'LiteLlm',
     'LlmCapabilities',
-    'ServiceTier',
 ]
 
 _LAZY_PROVIDERS: dict[str, tuple[list[str], str]] = {

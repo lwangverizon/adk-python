@@ -69,7 +69,6 @@ except ImportError as e:
 from ...models.base_llm import BaseLlm
 from ...models.llm_request import LlmRequest
 from ...models.llm_response import LlmResponse
-from ...utils import streaming_utils
 from ...utils._schema_utils import lowercase_schema_types
 from ._openai_schema import enforce_strict_openai_schema
 
@@ -790,8 +789,6 @@ class _StreamAccumulator:
       self._ensure_output_item(key, item_type)
       if item_type == 'function_call':
         self._track_function_call_item(key, item)
-        call = self.function_calls[key]
-        responses.append(self._partial_function_call_response(call))
     elif event_type in (
         'response.content_part.done',
         'response.output_text.done',
@@ -825,21 +822,9 @@ class _StreamAccumulator:
               'name': _get_value(event, 'name') or '',
               'call_id': _get_value(event, 'call_id'),
               'arguments': '',
-              'argument_deltas_emitted': False,
           },
       )
-      call['name'] = _get_value(event, 'name') or call.get('name') or ''
-      if not call.get('call_id'):
-        call['call_id'] = _get_value(event, 'call_id') or str(key)
-      argument_delta = _get_value(event, 'delta') or ''
-      call['arguments'] += argument_delta
-      if argument_delta:
-        call['argument_deltas_emitted'] = True
-        responses.append(
-            self._partial_function_call_response(
-                call, argument_delta=argument_delta
-            )
-        )
+      call['arguments'] += _get_value(event, 'delta') or ''
     elif event_type == 'response.function_call_arguments.done':
       responses.extend(self._close_reasoning_stream(event))
       key = self._stream_output_key(event, _get_value(event, 'call_id'))
@@ -850,22 +835,11 @@ class _StreamAccumulator:
               'name': _get_value(event, 'name') or '',
               'call_id': _get_value(event, 'call_id'),
               'arguments': '',
-              'argument_deltas_emitted': False,
           },
       )
-      call['name'] = _get_value(event, 'name') or call.get('name') or ''
-      if not call.get('call_id'):
-        call['call_id'] = _get_value(event, 'call_id') or str(key)
       arguments = _get_value(event, 'arguments')
       if arguments is not None:
         call['arguments'] = arguments
-      if call['arguments'] and not call['argument_deltas_emitted']:
-        responses.append(
-            self._partial_function_call_response(
-                call, argument_delta=call['arguments']
-            )
-        )
-        call['argument_deltas_emitted'] = True
     elif event_type == 'response.output_item.done':
       item = _get_value(event, 'item')
       item_type = _get_value(item, 'type')
@@ -876,14 +850,6 @@ class _StreamAccumulator:
       output_item['done_item'] = item
       if item_type == 'function_call':
         self._track_function_call_item(key, item)
-        call = self.function_calls[key]
-        if call['arguments'] and not call['argument_deltas_emitted']:
-          responses.append(
-              self._partial_function_call_response(
-                  call, argument_delta=call['arguments']
-              )
-          )
-          call['argument_deltas_emitted'] = True
     elif event_type in ('response.completed', 'response.incomplete'):
       self.response = _get_value(event, 'response')
       response_usage = _get_value(self.response, 'usage')
@@ -900,33 +866,6 @@ class _StreamAccumulator:
           )
       )
     return responses
-
-  def _partial_function_call_response(
-      self, call: dict[str, Any], argument_delta: str | None = None
-  ) -> LlmResponse:
-    partial_args = []
-    if argument_delta:
-      tracker = call.setdefault('tracker', streaming_utils._JsonPathTracker())
-      partial_args = tracker.handle_chunk(argument_delta)
-
-    return LlmResponse(
-        content=types.Content(
-            role='model',
-            parts=[
-                types.Part(
-                    function_call=types.FunctionCall(
-                        id=call.get('call_id'),
-                        name=call.get('name') or '',
-                        partial_args=partial_args or None,
-                        will_continue=True,
-                    )
-                )
-            ],
-        ),
-        partial=True,
-        model_version=self.model,
-        interaction_id=self.response_id,
-    )
 
   def _close_reasoning_stream(
       self, event: ResponseStreamEvent | Mapping[str, Any]
@@ -960,9 +899,11 @@ class _StreamAccumulator:
     if isinstance(output_index, int):
       return output_index
     item_id = _get_value(event, 'item_id')
-    if item_id:
-      return str(item_id)
-    return str(fallback)
+    if isinstance(item_id, str):
+      return item_id
+    if isinstance(fallback, (int, str)):
+      return fallback
+    return 'output'
 
   def _ensure_output_item(
       self, key: int | str, item_type: str | None
@@ -1015,21 +956,17 @@ class _StreamAccumulator:
       self, key: int | str, item: ResponseOutputItem | Mapping[str, Any]
   ) -> None:
     self._ensure_output_item(key, 'function_call')
+    # A done item may omit fields already streamed via deltas; preserve them.
     existing = self.function_calls.get(key, {})
     arguments = _get_value(item, 'arguments')
-    call_id = (
-        _get_value(item, 'call_id')
-        or _get_value(item, 'id')
-        or existing.get('call_id')
-        or str(key)
-    )
     self.function_calls[key] = {
         'name': _get_value(item, 'name') or existing.get('name') or '',
-        'call_id': call_id,
-        'arguments': arguments if arguments else existing.get('arguments', ''),
-        'argument_deltas_emitted': existing.get(
-            'argument_deltas_emitted', False
+        'call_id': (
+            _get_value(item, 'call_id')
+            or _get_value(item, 'id')
+            or existing.get('call_id')
         ),
+        'arguments': arguments if arguments else existing.get('arguments', ''),
     }
 
   def final_response(self) -> LlmResponse | None:
@@ -1085,7 +1022,7 @@ class _StreamAccumulator:
   def _function_call_part_from_accumulator(self, key: int | str) -> types.Part:
     call = self.function_calls[key]
     part = types.Part.from_function_call(
-        name=call.get('name') or '',
+        name=call.get('name'),
         args=_loads_json_object(call.get('arguments')),
     )
     part.function_call.id = call.get('call_id')

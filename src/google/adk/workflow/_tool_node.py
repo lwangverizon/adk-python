@@ -21,7 +21,6 @@ import json
 from typing import Any
 
 from google.genai import types
-from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from typing_extensions import override
@@ -74,9 +73,7 @@ class _ToolNode(BaseNode):
     if isinstance(args, types.Content):
       args = extract_text_from_content(args)
 
-    if isinstance(args, BaseModel):
-      args = args.model_dump()
-    elif isinstance(args, str):
+    if isinstance(args, str):
       args = args.strip()
       if not args:
         args = None
@@ -88,32 +85,11 @@ class _ToolNode(BaseNode):
 
     if args is None:
       args = {}
-    elif isinstance(args, dict):
-      args = dict(args)
-    else:
+    elif not isinstance(args, dict):
       raise TypeError(
           'The input to ToolNode must be a dictionary of tool arguments or'
           f' None, but got {type(args)}.'
       )
-
-    # Fallback to ctx.state for missing required parameters declared in tool declaration
-    declaration = getattr(self.tool, '_get_declaration', lambda: None)()
-    if declaration is not None:
-      required_params = ()
-      if getattr(declaration, 'parameters_json_schema', None) and isinstance(
-          declaration.parameters_json_schema, dict
-      ):
-        required_params = (
-            declaration.parameters_json_schema.get('required', ()) or ()
-        )
-      elif getattr(declaration, 'parameters', None) and getattr(
-          declaration.parameters, 'required', None
-      ):
-        required_params = declaration.parameters.required or ()
-
-      for param_name in required_params:
-        if param_name not in args and param_name in ctx.state:
-          args[param_name] = ctx.state[param_name]
 
     response = await self.tool.run_async(args=args, tool_context=tool_context)
     state_delta = (

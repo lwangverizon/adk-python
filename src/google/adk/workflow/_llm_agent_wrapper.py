@@ -32,8 +32,6 @@ from ..events.event import Event
 from ..flows.llm_flows.functions import REQUEST_CONFIRMATION_FUNCTION_CALL_NAME
 from ..utils._schema_utils import validate_schema
 from ..utils.content_utils import to_user_content
-from ._errors import WorkflowConfigurationError
-from ._errors import WorkflowInvariantError
 
 if TYPE_CHECKING:
   from ..agents.llm_agent import LlmAgent
@@ -238,17 +236,11 @@ async def _dispatch_task_fc(
   task's own function calls.  ``isolation_scope`` remains keyed by the
   FC id to keep task history scoped independently of branch ancestry.
   """
-  # Both call sites select FCs that already carry a name and an id, so an
-  # unnamed or id-less FC arriving here means that filtering was bypassed.
   if fc.name is None or fc.id is None:
-    raise WorkflowInvariantError(
-        'Task delegation calls require both a name and an ID.'
-    )
+    raise ValueError('Task delegation calls require both a name and an ID.')
   target_agent = parent_agent.root_agent.find_agent(fc.name)
   if target_agent is None:
-    raise WorkflowConfigurationError(
-        f'Task target agent {fc.name!r} not found.'
-    )
+    raise ValueError(f'Task target agent {fc.name!r} not found.')
   from .utils._workflow_graph_utils import build_node
 
   wrapped_target = build_node(target_agent)
@@ -402,7 +394,7 @@ async def run_llm_agent_as_node(
     agent.mode = 'single_turn'
 
   if agent.mode not in ('task', 'single_turn', 'chat'):
-    raise WorkflowConfigurationError(
+    raise ValueError(
         f'LlmAgent as node only supports task, single_turn, and chat mode,'
         f" but agent '{agent.name}' has mode='{agent.mode}'."
     )
@@ -510,6 +502,8 @@ async def run_llm_agent_as_node(
             had_task_fc = True
             break  # close this run_iter; outer loop re-enters
           if event.actions.transfer_to_agent:
+            target_name = event.actions.transfer_to_agent
+
             from ..agents.llm_agent import LlmAgent
 
             if (

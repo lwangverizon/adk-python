@@ -57,7 +57,6 @@ from ..base_authenticated_tool import BaseAuthenticatedTool
 from ..tool_context import ToolContext
 from ..transfer_to_agent_tool import transfer_to_agent
 from .mcp_session_manager import _http_debug_var
-from .mcp_session_manager import _is_session_terminated_error
 from .mcp_session_manager import MCPSessionManager
 from .mcp_session_manager import retry_on_errors
 from .session_context import SessionContext
@@ -605,40 +604,31 @@ class McpTool(BaseAuthenticatedTool):
     # its transport closed underneath it.
     self._mcp_session_manager._begin_session_use(final_headers)  # pylint: disable=protected-access
     try:
-      try:
-        if is_feature_enabled(FeatureName._MCP_GRACEFUL_ERROR_HANDLING):  # pylint: disable=protected-access
-          # Race the tool call against the background session task so that
-          # transport crashes (e.g. non-2xx HTTP responses from an AGW with
-          # Model Armor) surface immediately instead of hanging until
-          # sse_read_timeout (default 5 minutes) expires. ConnectionError is
-          # intentionally NOT caught here. Replaying a tool call after an
-          # ambiguous transport failure could duplicate a remote side effect, so
-          # the failure surfaces to the run_async wrapper without an automatic
-          # retry.
-          #
-          # The isinstance check is intentional: tests and external subclasses
-          # may inject mock session managers whose `_get_session_context`
-          # returns a Mock instead of a real SessionContext (or None). Falling
-          # back to the direct await keeps those callers working.
-          session_context = self._mcp_session_manager._get_session_context(  # pylint: disable=protected-access
-              headers=final_headers
-          )
-          if isinstance(session_context, SessionContext):
-            response = await session_context._run_guarded(call_coro)  # pylint: disable=protected-access
-          else:
-            response = await call_coro
+      if is_feature_enabled(FeatureName._MCP_GRACEFUL_ERROR_HANDLING):  # pylint: disable=protected-access
+        # Race the tool call against the background session task so that
+        # transport crashes (e.g. non-2xx HTTP responses from an AGW with
+        # Model Armor) surface immediately instead of hanging until
+        # sse_read_timeout (default 5 minutes) expires. ConnectionError is
+        # intentionally NOT caught here. Replaying a tool call after an
+        # ambiguous transport failure could duplicate a remote side effect, so
+        # the failure surfaces to the run_async wrapper without an automatic
+        # retry.
+        #
+        # The isinstance check is intentional: tests and external subclasses
+        # may inject mock session managers whose `_get_session_context`
+        # returns a Mock instead of a real SessionContext (or None). Falling
+        # back to the direct await keeps those callers working.
+        session_context = self._mcp_session_manager._get_session_context(  # pylint: disable=protected-access
+            headers=final_headers
+        )
+        if isinstance(session_context, SessionContext):
+          response = await session_context._run_guarded(call_coro)  # pylint: disable=protected-access
         else:
-          # Pre-fix behavior: await the call directly. This is what causes the
-          # ~300s hang when the underlying transport crashes.
           response = await call_coro
-      except Exception as e:
-        # The server has forgotten this session, so drop it here rather than
-        # let the next call be handed the same dead one.
-        if _is_session_terminated_error(e):
-          self._mcp_session_manager._discard_session(  # pylint: disable=protected-access
-              final_headers, session=session
-          )
-        raise
+      else:
+        # Pre-fix behavior: await the call directly. This is what causes the
+        # ~300s hang when the underlying transport crashes.
+        response = await call_coro
     finally:
       self._mcp_session_manager._end_session_use(final_headers)  # pylint: disable=protected-access
 
@@ -784,30 +774,23 @@ class McpTool(BaseAuthenticatedTool):
           )
           logger.error(error_msg)
           raise ValueError(error_msg)
+        elif (
+            self._credentials_manager._auth_config.auth_scheme.in_
+            != APIKeyIn.header
+        ):
+          error_msg = (
+              "McpTool only supports header-based API key authentication."
+              " Configured location:"
+              f" {self._credentials_manager._auth_config.auth_scheme.in_}"
+          )
+          logger.error(error_msg)
+          raise ValueError(error_msg)
         else:
-          # `in_` and `name` are declared on APIKey; a CustomAuthScheme may
-          # carry them too, so read them off the scheme rather than requiring
-          # an APIKey instance. A scheme with neither used to raise
-          # AttributeError here.
-          scheme = self._credentials_manager._auth_config.auth_scheme
-          key_location = getattr(scheme, "in_", None)
-          key_name = getattr(scheme, "name", None)
-          if key_location != APIKeyIn.header:
-            error_msg = (
-                "McpTool only supports header-based API key authentication."
-                f" Configured location: {key_location} (scheme:"
-                f" {type(scheme).__name__})"
-            )
-            logger.error(error_msg)
-            raise ValueError(error_msg)
-          if not isinstance(key_name, str):
-            error_msg = (
-                "API key auth scheme"
-                f" {type(scheme).__name__} carries no header name."
-            )
-            logger.error(error_msg)
-            raise ValueError(error_msg)
-          headers = {key_name: credential.api_key}
+          headers = {
+              self._credentials_manager._auth_config.auth_scheme.name: (
+                  credential.api_key
+              )
+          }
       elif credential.service_account:
         # Service accounts should be exchanged for access tokens before reaching this point
         logger.warning(

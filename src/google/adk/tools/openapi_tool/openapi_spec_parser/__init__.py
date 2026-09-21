@@ -17,11 +17,10 @@ from .openapi_spec_parser import OperationEndpoint
 from .openapi_spec_parser import ParsedOperation
 from .openapi_toolset import OpenAPIToolset
 from .operation_parser import OperationParser
+from .rest_api_tool import AuthPreparationState
 from .rest_api_tool import RestApiTool
 from .rest_api_tool import snake_to_lower_camel
-from .tool_auth_handler import AuthPreparationState
 from .tool_auth_handler import ToolAuthHandler
-from .tool_auth_handler import UnauthorizedRecoveryState
 
 __all__ = [
     'OpenApiSpecParser',
@@ -33,5 +32,4 @@ __all__ = [
     'snake_to_lower_camel',
     'AuthPreparationState',
     'ToolAuthHandler',
-    'UnauthorizedRecoveryState',
 ]

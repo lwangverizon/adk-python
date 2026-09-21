@@ -20,6 +20,7 @@ from typing import AsyncGenerator
 
 from google.genai import types
 
+from ..agents.base_agent import BaseAgent
 from ..events._rewind_events import _apply_rewinds
 from ..events.event import Event
 from ..sessions.base_session_service import BaseSessionService
@@ -27,7 +28,6 @@ from ..sessions.session import Session
 from ..telemetry.tracing import _build_compaction_attributes
 from ..telemetry.tracing import _build_compaction_result_attributes
 from ..telemetry.tracing import tracer
-from ..workflow import BaseNode
 from .app import App
 from .app import EventsCompactionConfig
 from .llm_event_summarizer import LlmEventSummarizer
@@ -187,9 +187,6 @@ def _latest_prompt_token_count(
 ) -> int | None:
   """Returns the most recently observed prompt token count, if available."""
   for event in reversed(events):
-    if event.actions and event.actions.compaction:
-      # Counts at or before a summarization describe a prompt it replaced.
-      break
     if (
         event.usage_metadata
         and event.usage_metadata.prompt_token_count is not None
@@ -250,7 +247,7 @@ def _has_sliding_window_config(config: EventsCompactionConfig | None) -> bool:
 
 
 def _ensure_compaction_summarizer(
-    *, config: EventsCompactionConfig, agent: BaseNode
+    *, config: EventsCompactionConfig, agent: BaseAgent
 ) -> None:
   """Ensures compaction config has a summarizer initialized."""
   if config.summarizer is not None:
@@ -401,7 +398,7 @@ async def _run_compaction_for_token_threshold_config(
     config: EventsCompactionConfig | None,
     session: Session,
     session_service: BaseSessionService,
-    agent: BaseNode,
+    agent: BaseAgent,
     agent_name: str = '',
     current_branch: str | None = None,
 ) -> bool:

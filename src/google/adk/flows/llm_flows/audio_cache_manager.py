@@ -22,16 +22,10 @@ existing imports working. RealtimeCacheEntry is public as
 
 from __future__ import annotations
 
-import warnings
+import logging
 
 from ...live._audio_cache_manager import AudioCacheConfig as AudioCacheConfig
 from ...live._audio_cache_manager import AudioCacheManager as AudioCacheManager
-from ...live._audio_cache_manager import logger as logger
 from ...live._audio_cache_manager import RealtimeCacheEntry as RealtimeCacheEntry
 
-warnings.warn(
-    'google.adk.flows.llm_flows.audio_cache_manager is deprecated; use'
-    ' google.adk.live._audio_cache_manager instead.',
-    DeprecationWarning,
-    stacklevel=2,
-)
+logger = logging.getLogger('google_adk.' + __name__)

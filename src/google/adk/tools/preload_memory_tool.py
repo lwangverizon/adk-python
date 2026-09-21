@@ -52,21 +52,18 @@ class PreloadMemoryTool(BaseTool):
       llm_request: LlmRequest,
   ) -> None:
     user_content = tool_context.user_content
-    if not user_content or not user_content.parts:
+    if (
+        not user_content
+        or not user_content.parts
+        or not user_content.parts[0].text
+    ):
       return
 
-    user_query = ' '.join(part.text for part in user_content.parts if part.text)
-    if not user_query:
-      return
-
+    user_query: str = user_content.parts[0].text
     try:
       response = await tool_context.search_memory(user_query)
     except Exception:
-      logger.warning(
-          'Failed to preload memory (query length: %d)',
-          len(user_query),
-          exc_info=True,
-      )
+      logging.warning('Failed to preload memory for query: %s', user_query)
       return
 
     if not response.memories:

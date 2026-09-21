@@ -1,0 +1,17 @@
+{
+  "upstream_repository": "https://github.com/google/adk-python.git",
+  "upstream_tag": "v2.9.0",
+  "upstream_commit": "16793842ccb8206824a80a206c2ab42d3064d9f4",
+  "official_wheel_sha256": "3b15b91fdaf8e7193006d0ee4e745f45b4f39c62bdc1a6a8e60a4a8b1972bd3b",
+  "version": "2.9.0+vzgpt.2",
+  "sync_policy": "Explicit official release tags only; never merge upstream/main.",
+  "allowed_source_differences": [
+    "src/google/adk/version.py",
+    "src/google/adk/sessions/base_session_service.py",
+    "src/google/adk/sessions/database_session_service.py",
+    "src/google/adk/sessions/in_memory_session_service.py",
+    "src/google/adk/sessions/sqlite_session_service.py",
+    "src/google/adk/sessions/vertex_ai_session_service.py"
+  ],
+  "extension": "Preserve VZGPT merge_state API and its regression tests."
+}

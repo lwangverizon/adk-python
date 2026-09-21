@@ -28,7 +28,6 @@ except ImportError:
 
 if TYPE_CHECKING:
   from sqlalchemy.engine import Connection
-  from sqlalchemy.engine import Engine
   from sqlalchemy.engine.reflection import Inspector
 
 logger = logging.getLogger("google_adk." + __name__)
@@ -148,23 +147,6 @@ def _redact_db_url(db_url: str) -> str:
     return _UNPARSEABLE_DB_URL
 
 
-def _create_engine_for_url(db_url: str) -> Engine:
-  """Creates a sync engine, reporting only the redacted URL when it fails.
-
-  The parser quotes the rejected URL back in its message, so the original
-  exception is replaced by one naming the redacted URL and the error type.
-  """
-  try:
-    return create_sync_engine(to_sync_url(db_url))
-  except Exception as e:
-    message = (
-        f"Failed to connect to database {_redact_db_url(db_url)}:"
-        f" {type(e).__name__}"
-    )
-    logger.warning(message)
-    raise RuntimeError(message) from e
-
-
 def get_db_schema_version(db_url: str) -> str:
   """Reads schema version from DB.
 
@@ -177,8 +159,9 @@ def get_db_schema_version(db_url: str) -> str:
     The detected schema version as a string. Returns `LATEST_SCHEMA_VERSION`
     if it's a new database.
   """
-  engine = _create_engine_for_url(db_url)
+  engine = None
   try:
+    engine = create_sync_engine(to_sync_url(db_url))
     with engine.connect() as connection:
       inspector = inspect(connection)
       return _get_schema_version_impl(inspector, connection)
@@ -189,4 +172,5 @@ def get_db_schema_version(db_url: str) -> str:
     )
     raise
   finally:
-    engine.dispose()
+    if engine:
+      engine.dispose()

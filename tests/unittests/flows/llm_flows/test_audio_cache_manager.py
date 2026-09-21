@@ -16,14 +16,11 @@
 
 from __future__ import annotations
 
-import importlib
-
 from google.adk.flows.llm_flows import audio_cache_manager as legacy_module
 from google.adk.flows.llm_flows.audio_cache_manager import AudioCacheConfig as LegacyAudioCacheConfig
 from google.adk.flows.llm_flows.audio_cache_manager import AudioCacheManager as LegacyAudioCacheManager
 from google.adk.live._audio_cache_manager import AudioCacheConfig
 from google.adk.live._audio_cache_manager import AudioCacheManager
-import pytest
 
 
 def test_audio_cache_manager_reexport():
@@ -31,11 +28,3 @@ def test_audio_cache_manager_reexport():
   assert LegacyAudioCacheConfig is AudioCacheConfig
   assert getattr(legacy_module, 'AudioCacheManager') is AudioCacheManager
   assert getattr(legacy_module, 'AudioCacheConfig') is AudioCacheConfig
-
-
-def test_audio_cache_manager_deprecation_warning():
-  with pytest.warns(
-      DeprecationWarning,
-      match='use google.adk.live._audio_cache_manager instead',
-  ):
-    importlib.reload(legacy_module)
