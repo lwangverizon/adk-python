@@ -147,22 +147,25 @@ class NodeTool(BaseTool):
     try:
       node_input = self.node._validate_input_data(node_input)
     except (ValidationError, WorkflowDataError) as e:
-      # Same shape as FunctionTool's argument validation errors, so the
-      # model can correct its arguments and retry.
-      return {
-          'error': (
-              f'Invoking `{self.name}()` failed due to argument validation'
-              f' errors:\n{e}\nYou could retry calling this tool with'
-              ' corrected argument types.'
-          )
-      }
+      # VZGPT fork: keep the 2.9.0 result for invalid node input. Upstream
+      # returns FunctionTool's {'error': ...} shape, which retry plugins treat
+      # as a tool failure.
+      return f'Error validating input for node: {e}'
 
-    res = await _run_node_in_tool_context(
-        self.node,
-        tool_name=self.name,
-        node_input=node_input,
-        tool_context=tool_context,
-    )
+    try:
+      res = await _run_node_in_tool_context(
+          self.node,
+          tool_name=self.name,
+          node_input=node_input,
+          tool_context=tool_context,
+      )
+    except Exception as e:  # NodeInterruptedError is a BaseException.
+      # VZGPT fork: as in 2.9.0, a failed node is reported to the model as the
+      # tool result instead of failing the run (upstream b4c5272c5).
+      cause = (
+          e.__cause__ if isinstance(e.__cause__, DynamicNodeFailError) else e
+      )
+      return f'Error running node {self.name}: {cause}'
     if res is None:
       return {'result': None}
     return res
