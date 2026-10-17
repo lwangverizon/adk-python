@@ -1,0 +1,20 @@
+name: VZGPT release baseline
+
+on:
+  pull_request:
+    branches: [vzgpt-core]
+  push:
+    branches: [vzgpt-core]
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+      - run: uv run --no-project python scripts/verify_vzgpt_release.py
