@@ -52,6 +52,7 @@ try:
   from sqlalchemy.ext.asyncio import AsyncSession as DatabaseSessionFactory
   from sqlalchemy.ext.asyncio import create_async_engine
   from sqlalchemy.pool import StaticPool
+  from sqlalchemy.schema import CreateIndex
 except ImportError as e:
   # Re-raised by __init__, so the module still imports without the db extra.
   _sqlalchemy_import_error = e
@@ -239,6 +240,41 @@ def _set_sqlite_pragma(
   cursor.close()
 
 
+# VZGPT fork policy: dialects on which a missing index on an existing table may
+# be built while the service starts. On a database server a plain CREATE INDEX
+# blocks writes to the table for the whole build (hours on a multi-terabyte
+# events table), so a missing index is reported for out-of-band creation.
+_RUNTIME_INDEX_DDL_DIALECTS = frozenset({_SQLITE_DIALECT})
+
+
+def _report_missing_schema_indexes(
+    connection: Connection, metadata: MetaData
+) -> None:
+  """Logs declared indexes missing from existing tables without building them.
+
+  ``metadata.create_all`` has already created each missing table together with
+  its indexes, so an index still missing here belongs to a table that existed
+  before startup.
+  """
+  inspector = inspect(connection)
+  for table in metadata.sorted_tables:
+    existing_indexes = {
+        idx["name"] for idx in inspector.get_indexes(table.name)
+    }
+    for index in sorted(table.indexes, key=lambda item: item.name or ""):
+      if index.name in existing_indexes:
+        continue
+      logger.warning(
+          "Index %s on existing table %s is missing and is not built at"
+          " runtime on %s. Build it out-of-band without blocking writes"
+          " (PostgreSQL: CREATE INDEX CONCURRENTLY): %s",
+          index.name,
+          table.name,
+          connection.dialect.name,
+          str(CreateIndex(index).compile(dialect=connection.dialect)).strip(),
+      )
+
+
 def _ensure_schema_indexes_exist(
     connection: Connection, metadata: MetaData
 ) -> None:
@@ -252,7 +288,13 @@ def _ensure_schema_indexes_exist(
     updates. Operators of large existing deployments may pre-create new indexes
     (e.g. via ``CREATE INDEX CONCURRENTLY``) and drop obsolete indexes
     out-of-band during a maintenance window.
+
+    VZGPT fork: outside ``_RUNTIME_INDEX_DDL_DIALECTS`` missing indexes on
+    existing tables are only reported, never built at runtime.
   """
+  if connection.dialect.name not in _RUNTIME_INDEX_DDL_DIALECTS:
+    _report_missing_schema_indexes(connection, metadata)
+    return
   logger.debug("Ensuring schema indexes exist for metadata tables.")
   for table in metadata.sorted_tables:
     for index in sorted(table.indexes, key=lambda item: item.name or ""):
