@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
 from datetime import timezone
@@ -35,6 +36,7 @@ from google.adk.events.event_actions import EventActions
 from google.adk.features import FeatureName
 from google.adk.features import override_feature_enabled
 from google.adk.sessions import database_session_service
+from google.adk.sessions.base_session_service import BaseSessionService
 from google.adk.sessions.base_session_service import GetSessionConfig
 from google.adk.sessions.database_session_service import DatabaseSessionService
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
@@ -1380,6 +1382,207 @@ async def test_temp_state_visible_across_sequential_events(session_service):
   assert 'temp:output' not in event1.actions.state_delta
 
 
+@pytest.fixture(params=_conformance.BACKENDS, ids=lambda backend: backend.name)
+async def merge_state_session_service(
+    request: pytest.FixtureRequest, tmp_path
+) -> AsyncIterator[BaseSessionService]:
+  """Yields each backend that implements the optional ``merge_state`` API.
+
+  Unlike the behaviors behind the shared ``session_service`` fixture,
+  ``merge_state`` is opt-in: ``BaseSessionService`` documents a
+  ``NotImplementedError`` for backends with no server-side state merge. So the
+  tests taking this fixture state a contract only the *implementing* backends
+  owe their callers, and a backend without one is skipped rather than recorded
+  as a divergence — declining an optional API is not a defect to be fixed.
+
+  Support is detected from the override rather than a hand-kept list, so a
+  backend that gains ``merge_state`` is held to these tests automatically.
+  """
+  async with request.param.make(tmp_path) as service:
+    if type(service).merge_state is BaseSessionService.merge_state:
+      pytest.skip(f'{type(service).__name__} does not implement merge_state.')
+    yield service
+
+
+@pytest.mark.asyncio
+async def test_merge_state_merges_session_scoped_key(
+    merge_state_session_service,
+):
+  app_name = 'my_app'
+  user_id = 'u1'
+  session = await merge_state_session_service.create_session(
+      app_name=app_name, user_id=user_id, session_id='s1', state={'sk1': 'v1'}
+  )
+
+  await merge_state_session_service.merge_state(
+      app_name=app_name,
+      user_id=user_id,
+      session_id=session.id,
+      delta={'sk2': 'v2'},
+  )
+
+  got = await merge_state_session_service.get_session(
+      app_name=app_name, user_id=user_id, session_id=session.id
+  )
+  assert got.state.get('sk1') == 'v1'
+  assert got.state.get('sk2') == 'v2'
+  # merge_state must not write an event.
+  assert got.events == []
+
+
+@pytest.mark.asyncio
+async def test_merge_state_merges_app_scoped_key(merge_state_session_service):
+  app_name = 'my_app'
+  session = await merge_state_session_service.create_session(
+      app_name=app_name, user_id='u1', session_id='s1'
+  )
+
+  await merge_state_session_service.merge_state(
+      app_name=app_name,
+      user_id='u1',
+      session_id=session.id,
+      delta={'app:flag': True},
+  )
+
+  # Visible to the same session and to a different user's session.
+  got = await merge_state_session_service.get_session(
+      app_name=app_name, user_id='u1', session_id='s1'
+  )
+  assert got.state.get('app:flag') is True
+  other = await merge_state_session_service.create_session(
+      app_name=app_name, user_id='u2', session_id='s2'
+  )
+  assert other.state.get('app:flag') is True
+
+
+@pytest.mark.asyncio
+async def test_merge_state_merges_user_scoped_key(merge_state_session_service):
+  app_name = 'my_app'
+  session = await merge_state_session_service.create_session(
+      app_name=app_name, user_id='u1', session_id='s1'
+  )
+
+  await merge_state_session_service.merge_state(
+      app_name=app_name,
+      user_id='u1',
+      session_id=session.id,
+      delta={'user:tier': 'gold'},
+  )
+
+  assert await merge_state_session_service.get_user_state(
+      app_name=app_name, user_id='u1'
+  ) == {'tier': 'gold'}
+  got = await merge_state_session_service.get_session(
+      app_name=app_name, user_id='u1', session_id='s1'
+  )
+  assert got.state.get('user:tier') == 'gold'
+
+
+@pytest.mark.asyncio
+async def test_merge_state_cross_scope_routing(merge_state_session_service):
+  app_name = 'my_app'
+  session = await merge_state_session_service.create_session(
+      app_name=app_name, user_id='u1', session_id='s1'
+  )
+
+  await merge_state_session_service.merge_state(
+      app_name=app_name,
+      user_id='u1',
+      session_id=session.id,
+      delta={'app:a': 1, 'user:b': 2, 'sk': 3},
+  )
+
+  got = await merge_state_session_service.get_session(
+      app_name=app_name, user_id='u1', session_id='s1'
+  )
+  assert got.state.get('app:a') == 1
+  assert got.state.get('user:b') == 2
+  assert got.state.get('sk') == 3
+
+
+@pytest.mark.asyncio
+async def test_merge_state_rejects_temp_keys(merge_state_session_service):
+  app_name = 'my_app'
+  session = await merge_state_session_service.create_session(
+      app_name=app_name, user_id='u1', session_id='s1'
+  )
+
+  with pytest.raises(ValueError, match='temp:'):
+    await merge_state_session_service.merge_state(
+        app_name=app_name,
+        user_id='u1',
+        session_id=session.id,
+        delta={'temp:x': 1},
+    )
+  # Mixed delta with a temp: key is rejected entirely (nothing persisted).
+  with pytest.raises(ValueError, match='temp:'):
+    await merge_state_session_service.merge_state(
+        app_name=app_name,
+        user_id='u1',
+        session_id=session.id,
+        delta={'sk': 1, 'temp:x': 2},
+    )
+  got = await merge_state_session_service.get_session(
+      app_name=app_name, user_id='u1', session_id='s1'
+  )
+  assert 'sk' not in got.state
+
+
+@pytest.mark.asyncio
+async def test_merge_state_empty_delta_is_noop(merge_state_session_service):
+  app_name = 'my_app'
+  session = await merge_state_session_service.create_session(
+      app_name=app_name, user_id='u1', session_id='s1', state={'sk1': 'v1'}
+  )
+
+  await merge_state_session_service.merge_state(
+      app_name=app_name, user_id='u1', session_id=session.id, delta={}
+  )
+
+  got = await merge_state_session_service.get_session(
+      app_name=app_name, user_id='u1', session_id='s1'
+  )
+  assert got.state == {'sk1': 'v1'}
+  assert got.events == []
+
+
+@pytest.mark.asyncio
+async def test_merge_state_missing_session_raises_for_session_delta(
+    merge_state_session_service,
+):
+  with pytest.raises(ValueError, match='not found'):
+    await merge_state_session_service.merge_state(
+        app_name='my_app',
+        user_id='u1',
+        session_id='does_not_exist',
+        delta={'sk': 1},
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_state_auto_creates_app_user_rows(
+    merge_state_session_service,
+):
+  # No create_session for this (app, user); app/user merges should still work
+  # and not require a session to exist.
+  app_name = 'fresh_app'
+  await merge_state_session_service.merge_state(
+      app_name=app_name,
+      user_id='fresh_user',
+      session_id='unused',
+      delta={'app:x': 1, 'user:y': 2},
+  )
+
+  assert await merge_state_session_service.get_user_state(
+      app_name=app_name, user_id='fresh_user'
+  ) == {'y': 2}
+  # The app-scoped value is observable via a freshly created session.
+  session = await merge_state_session_service.create_session(
+      app_name=app_name, user_id='fresh_user', session_id='s1'
+  )
+  assert session.state.get('app:x') == 1
+
+
 @pytest.mark.asyncio
 async def test_get_session_respects_user_id(session_service):
   app_name = 'my_app'
@@ -2075,6 +2278,150 @@ async def test_append_event_same_timestamp_single_writer_not_stale(
     await session_service.append_event(session, event3)
 
     assert len(session.events) == 3
+
+
+@pytest.mark.asyncio
+async def test_merge_state_does_not_bump_occ_marker_for_session_scope():
+  service = DatabaseSessionService('sqlite+aiosqlite:///:memory:')
+  try:
+    session = await service.create_session(
+        app_name='my_app', user_id='user', session_id='s1'
+    )
+    original_marker = session._storage_update_marker
+
+    await service.merge_state(
+        app_name='my_app',
+        user_id='user',
+        session_id='s1',
+        delta={'sk': 'v'},
+    )
+
+    # The stored OCC marker must be unchanged by the merge.
+    schema = service._get_schema_classes()
+    async with service.database_session_factory() as sql_session:
+      storage_session = await sql_session.get(
+          schema.StorageSession, ('my_app', 'user', 's1')
+      )
+      assert storage_session.get_update_marker() == original_marker
+      assert storage_session.state.get('sk') == 'v'
+
+    # The originally-held session is NOT stale: it can still append.
+    event = Event(
+        invocation_id='inv1',
+        author='user',
+        timestamp=session.last_update_time + 10,
+    )
+    await service.append_event(session, event)
+
+    final = await service.get_session(
+        app_name='my_app', user_id='user', session_id='s1'
+    )
+    assert final.state.get('sk') == 'v'
+    assert [e.invocation_id for e in final.events] == ['inv1']
+  finally:
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_state_does_not_bump_occ_marker_for_app_user_scope():
+  service = DatabaseSessionService('sqlite+aiosqlite:///:memory:')
+  try:
+    session = await service.create_session(
+        app_name='my_app', user_id='user', session_id='s1'
+    )
+    original_marker = session._storage_update_marker
+
+    await service.merge_state(
+        app_name='my_app',
+        user_id='user',
+        session_id='s1',
+        delta={'app:a': 1, 'user:b': 2},
+    )
+
+    schema = service._get_schema_classes()
+    async with service.database_session_factory() as sql_session:
+      storage_session = await sql_session.get(
+          schema.StorageSession, ('my_app', 'user', 's1')
+      )
+      assert storage_session.get_update_marker() == original_marker
+
+    # The held session can still append after app/user merges.
+    event = Event(
+        invocation_id='inv1',
+        author='user',
+        timestamp=session.last_update_time + 10,
+    )
+    await service.append_event(session, event)
+
+    final = await service.get_session(
+        app_name='my_app', user_id='user', session_id='s1'
+    )
+    assert final.state.get('app:a') == 1
+    assert final.state.get('user:b') == 2
+    assert [e.invocation_id for e in final.events] == ['inv1']
+  finally:
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_state_no_events_row_created():
+  service = DatabaseSessionService('sqlite+aiosqlite:///:memory:')
+  try:
+    await service.create_session(
+        app_name='my_app', user_id='user', session_id='s1'
+    )
+
+    await service.merge_state(
+        app_name='my_app',
+        user_id='user',
+        session_id='s1',
+        delta={'app:a': 1, 'user:b': 2, 'sk': 3},
+    )
+
+    schema = service._get_schema_classes()
+    async with service.database_session_factory() as sql_session:
+      result = await sql_session.execute(select(schema.StorageEvent))
+      assert result.scalars().all() == []
+  finally:
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_state_concurrent_independent_keys_no_lost_update():
+  service = DatabaseSessionService('sqlite+aiosqlite:///:memory:')
+  try:
+    await service.create_session(
+        app_name='my_app', user_id='user', session_id='s1'
+    )
+
+    iteration_count = 8
+    for i in range(iteration_count):
+      await asyncio.gather(
+          service.merge_state(
+              app_name='my_app',
+              user_id='user',
+              session_id='s1',
+              delta={f'sk{i}-1': f'v{i}-1'},
+          ),
+          service.merge_state(
+              app_name='my_app',
+              user_id='user',
+              session_id='s1',
+              delta={f'sk{i}-2': f'v{i}-2'},
+          ),
+      )
+
+    final = await service.get_session(
+        app_name='my_app', user_id='user', session_id='s1'
+    )
+    # Both independent keys from every iteration must be present (no lost
+    # update), and no event row was created.
+    for i in range(iteration_count):
+      assert final.state.get(f'sk{i}-1') == f'v{i}-1'
+      assert final.state.get(f'sk{i}-2') == f'v{i}-2'
+    assert final.events == []
+  finally:
+    await service.close()
 
 
 @pytest.mark.asyncio
