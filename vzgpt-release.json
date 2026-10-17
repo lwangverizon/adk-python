@@ -1,0 +1,44 @@
+{
+  "upstream_repository": "https://github.com/google/adk-python.git",
+  "upstream_ref": "main",
+  "upstream_commit": "a6ed85905d4c1d1f285ba9d4f76a9d801b66d17f",
+  "upstream_version": "2.12.0",
+  "version": "2.12.0+vzgpt.3",
+  "sync_policy": "Merge a reviewed upstream main commit, update this manifest, and run scripts/verify_vzgpt_release.py.",
+  "allowed_source_differences": [
+    "src/google/adk/version.py",
+    "src/google/adk/sessions/base_session_service.py",
+    "src/google/adk/sessions/database_session_service.py",
+    "src/google/adk/sessions/in_memory_session_service.py",
+    "src/google/adk/sessions/sqlite_session_service.py",
+    "src/google/adk/sessions/vertex_ai_session_service.py"
+  ],
+  "declared_session_indexes": {
+    "v0": {
+      "events": {
+        "idx_events_app_user_session_ts_id": [
+          "app_name",
+          "user_id",
+          "session_id",
+          "timestamp DESC",
+          "id DESC"
+        ]
+      }
+    },
+    "v1": {
+      "events": {
+        "idx_events_app_user_session_ts_id": [
+          "app_name",
+          "user_id",
+          "session_id",
+          "timestamp DESC",
+          "id DESC"
+        ]
+      }
+    }
+  },
+  "extensions": [
+    "merge_state API in five session services, with regression tests.",
+    "No runtime index builds on existing tables outside SQLite."
+  ]
+}
