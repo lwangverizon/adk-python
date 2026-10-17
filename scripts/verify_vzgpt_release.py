@@ -24,12 +24,25 @@ import subprocess
 _ROOT = Path(__file__).resolve().parents[1]
 _SERVICE = 'src/google/adk/sessions/database_session_service.py'
 _SCHEMAS = 'src/google/adk/sessions/schemas'
-# Fork guard markers that a sync must not drop.
-_REQUIRED_IN_SERVICE = (
-    '_RUNTIME_INDEX_DDL_DIALECTS = frozenset({_SQLITE_DIALECT})',
-    'if connection.dialect.name not in _RUNTIME_INDEX_DDL_DIALECTS:',
-    'async def merge_state(',
-)
+# Fork guard markers that a sync must not drop, by file.
+_REQUIRED = {
+    _SERVICE: (
+        '_RUNTIME_INDEX_DDL_DIALECTS = frozenset({_SQLITE_DIALECT})',
+        'if connection.dialect.name not in _RUNTIME_INDEX_DDL_DIALECTS:',
+        'async def merge_state(',
+    ),
+    'src/google/adk/tools/_node_tool.py': (
+        "return f'Error validating input for node: {e}'",
+        "return f'Error running node {self.name}: {cause}'",
+    ),
+    'src/google/adk/flows/llm_flows/tools/_caller.py': (
+        '    if isinstance(tool, AgentTool):\n',
+    ),
+    'src/google/adk/flows/llm_flows/context/_contents.py': (
+        '_VZGPT_KEEP_TOOL_SUB_BRANCH_EVENTS = True',
+        '  if _VZGPT_KEEP_TOOL_SUB_BRANCH_EVENTS:\n    return False',
+    ),
+}
 # Destructive or serializing startup DDL from earlier incidents.
 _FORBIDDEN_IN_SERVICE = ('_SUPERSEDED_INDEX_NAMES', 'pg_advisory_xact_lock')
 
@@ -92,10 +105,12 @@ def main() -> None:
   if unexpected:
     raise SystemExit(f'Unreviewed source drift: {sorted(unexpected)}')
 
+  for path, markers in _REQUIRED.items():
+    source = (_ROOT / path).read_text(encoding='utf-8')
+    for required in markers:
+      if required not in source:
+        raise SystemExit(f'VZGPT fork guard missing in {path}: {required}')
   service = (_ROOT / _SERVICE).read_text(encoding='utf-8')
-  for required in _REQUIRED_IN_SERVICE:
-    if required not in service:
-      raise SystemExit(f'VZGPT session guard missing: {required}')
   for forbidden in _FORBIDDEN_IN_SERVICE:
     if forbidden in service:
       raise SystemExit(f'Unsafe session initialization returned: {forbidden}')

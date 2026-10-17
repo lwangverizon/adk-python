@@ -779,6 +779,10 @@ def _is_event_belongs_to_branch(
   return _BranchPath.is_same_or_below(invocation_branch, event_branch)
 
 
+# VZGPT fork: keep tool sub-branch events in the calling agent's context.
+_VZGPT_KEEP_TOOL_SUB_BRANCH_EVENTS = True
+
+
 def _is_tool_sub_branch_event(
     current_branch: str | None,
     event: Event,
@@ -800,7 +804,13 @@ def _is_tool_sub_branch_event(
   Every segment below ``current_branch`` is checked, not only the leaf: a
   Workflow run by a NodeTool that fans out publishes on
   ``<tool>@<function_call_id>.<node>@<run_id>``.
+
+  VZGPT fork: disabled, as in 2.9.0 (upstream 2e06fdc81). VZGPT workflow tools
+  return an acknowledgement and publish the customer-facing answer on their
+  sub-branch. The calling agent must keep that answer in later turns.
   """
+  if _VZGPT_KEEP_TOOL_SUB_BRANCH_EVENTS:
+    return False
   return _BranchPath.has_tool_segment_below(
       event.branch, current_branch, agent_name, tool_call_ids
   )

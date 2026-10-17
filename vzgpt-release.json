@@ -12,6 +12,9 @@
     "src/google/adk/sessions/in_memory_session_service.py",
     "src/google/adk/sessions/sqlite_session_service.py",
     "src/google/adk/sessions/vertex_ai_session_service.py",
+    "src/google/adk/flows/llm_flows/context/_contents.py",
+    "src/google/adk/flows/llm_flows/tools/_caller.py",
+    "src/google/adk/tools/_node_tool.py",
     "src/google/adk/sessions/state.py"
   ],
   "declared_session_indexes": {
@@ -41,6 +44,9 @@
   "extensions": [
     "merge_state API in five session services, with regression tests.",
     "No runtime index builds on existing tables outside SQLite.",
+    "NodeTool failures and invalid input are returned to the model as in 2.9.0.",
+    "NodeTool results with skip_summarization are not appended as visible text.",
+    "Tool sub-branch events stay in the calling agent's history as in 2.9.0.",
     "Session State keeps the 2.12.0 semantics: no container snapshots on read and no implicit recording of in-place nested writes (upstream ce2fdc5aa, 662b0175a)."
   ]
 }
