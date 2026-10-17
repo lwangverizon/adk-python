@@ -28,7 +28,29 @@ The built wheel differs from the official wheel only in the files listed under
    still get their indexes, and SQLite keeps the upstream behavior. Tests:
    `tests/unittests/sessions/migration/test_vzgpt_runtime_index_policy.py`.
 
-Upstream schemas and upstream tests are not modified.
+3. **NodeTool results keep their 2.9.0 behavior.** Upstream `main` changed
+   three things about workflow tools. The fork keeps the 2.9.0 behavior for
+   each, because VZGPT workflows end the turn with an internal acknowledgement
+   and publish the customer-facing answer themselves:
+   - A failed node is returned to the model as
+     `Error running node <name>: ...` instead of failing the run (upstream
+     b4c5272c5). Invalid input is returned as
+     `Error validating input for node: ...`.
+   - A NodeTool result is not appended as visible text when it sets
+     `skip_summarization`. Upstream 5a0421cbc appends it, which would show
+     the acknowledgement JSON to the customer.
+   - Events a workflow tool publishes on its `<tool>@<call id>` sub-branch stay
+     in the calling agent's history (upstream 2e06fdc81 removes them).
+     Otherwise the model loses the workflow's answer on the next turn.
+
+   Fork tests: `tests/unittests/workflow/test_vzgpt_node_tool_compat.py` and
+   `tests/unittests/flows/llm_flows/context/test_vzgpt_tool_sub_branch_history.py`.
+
+Upstream schemas and upstream test files are not modified. Upstream tests that
+assert the newer NodeTool behavior are listed in
+`tests/unittests/_vzgpt_fork_expectations.py` and marked strict xfail by
+fork-owned `conftest.py` files, so a sync that loses a fork behavior fails the
+suite.
 
 ## Events index state
 
@@ -66,7 +88,8 @@ WHERE indexrelid = 'idx_events_app_user_session_ts_id'::regclass;
    `version` in `vzgpt-release.json`.
 3. Run `uv run --no-project python scripts/verify_vzgpt_release.py`.
    - It rejects source changes outside the allowlist.
-   - It rejects a sync that drops the index guard or `merge_state`.
+   - It rejects a sync that drops any fork guard (index policy, `merge_state`,
+     NodeTool behavior).
    - It rejects any change to the declared session indexes. If upstream changed
      an index, plan the production build before you update
      `declared_session_indexes`.
@@ -77,15 +100,15 @@ protection.
 
 ## Validation (2026-10-17)
 
-- The wheel differs from a wheel built from the baseline commit only in the six
-  allowlisted files.
+- The wheel differs from a wheel built from the baseline commit only in the
+  nine allowlisted files.
 - Unit tests ran in a fresh Python 3.11 environment with all extras.
-  - `tests/unittests/sessions`: 645 passed, 16 skipped.
-  - Full `tests/unittests -n auto`: 20,243 passed, 58 failed, 108 skipped.
-    Rerun in isolation, 51 of the 58 passed. The same 7 failed on this branch
-    and on the upstream baseline: six depend on the local machine (for example
-    `OTEL_*` variables) and one timing-sensitive web UI test fails on a
-    different parameter each run. No session test failed.
+  - Full `tests/unittests -n auto`: 20,277 passed, 9 failed, 39 xfailed (19 of
+    them are the strict-xfail upstream tests listed above).
+  - Six of the 9 failures also fail on upstream `main` and depend on the local
+    machine (for example `OTEL_*` variables). The other three are
+    load-sensitive and pass in isolation.
+  - The fork tests fail without the fork changes.
 - Session tests against the extracted wheel in the VZGPT Python 3.13
   environment (SQLAlchemy 2.0.50): 644 passed, 16 skipped. One test was
   deselected because that environment lacks
