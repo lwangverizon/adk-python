@@ -100,31 +100,20 @@ protection.
 
 ## Validation (2026-10-17)
 
-- The wheel differs from a wheel built from the baseline commit only in the
-  nine allowlisted files.
+- The wheel differs from the official PyPI 2.12.0 wheel only in the nine
+  allowlisted files. A tag build matches the official wheel's 795 Python files
+  byte for byte.
+- `ce2fdc5aa` is absent: `sessions/state.py` keeps no container snapshots.
 - Unit tests ran in a fresh Python 3.11 environment with all extras.
-  - Full `tests/unittests -n auto`: 20,277 passed, 9 failed, 39 xfailed (19 of
-    them are the strict-xfail upstream tests listed above).
-  - Six of the 9 failures also fail on upstream `main` and depend on the local
-    machine (for example `OTEL_*` variables). The other three are
-    load-sensitive and pass in isolation.
-  - The fork tests fail without the fork changes.
-- Session tests against the extracted wheel in the VZGPT Python 3.13
-  environment (SQLAlchemy 2.0.50): 644 passed, 16 skipped. One test was
-  deselected because that environment lacks
-  `google.cloud.sqlalchemy_spanner`.
-- Local PostgreSQL 17 (temporary cluster, Unix socket only), with a schema
-  created by 2.9.0+vzgpt.2 and 6M events (1.6 GB):
-  - Starting this wheel took 0.05 s. It issued no index DDL, logged one
-    warning, and concurrent inserts stayed under 10 ms.
-  - Upstream `main` without the fork guard built the index while blocking
-    inserts. On the same data that took 27 s.
-  - `merge_state` worked on PostgreSQL, and an `append_event` from a session
-    loaded before the merge still succeeded afterwards.
-  - Rolling back to 2.9.0+vzgpt.2 on the same database issued no DDL.
-  - On an empty database the wheel created all tables with the upstream index.
-  - After an out-of-band `CREATE INDEX CONCURRENTLY`, startup issued no DDL and
-    logged no warning.
+  - Full `tests/unittests -n auto`: 18,694 passed, 25 failed, 32 xfailed.
+  - With the shell's `OTEL_*` variables unset, 24 of the 25 pass on both this
+    branch and the official tag. The remaining one
+    (`test_handle_login_with_google_option_3`) fails on both and depends on the
+    local machine.
+  - The strict-xfail upstream tests stay failing, and the fork tests pass.
+- VZGPT ran the rolling-deploy, rollback and missing-index PostgreSQL
+  simulation against this wheel through its production session-service
+  constructor. See that repository's ADK pin validation document.
 
 ## Deployment boundary
 
