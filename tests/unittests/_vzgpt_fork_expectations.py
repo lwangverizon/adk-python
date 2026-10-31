@@ -21,6 +21,8 @@ own tests assert the kept behavior:
 - NodeTool results: tests/unittests/workflow/test_vzgpt_node_tool_compat.py
 - Tool sub-branch history:
   tests/unittests/flows/llm_flows/context/test_vzgpt_tool_sub_branch_history.py
+- Session State (2.12.0 semantics, no nested-write recording):
+  tests/unittests/sessions/test_vzgpt_state_semantics.py
 """
 
 import pytest
@@ -28,6 +30,7 @@ import pytest
 _NODE_TOOL = 'VZGPT fork keeps 2.9.0 NodeTool result behavior'
 _SUB_BRANCH = 'VZGPT fork keeps tool sub-branch events in caller history'
 _ENTRY_ARGS = 'test_node_tool_workflow_entry_args_are_validated_before_run'
+_STATE = 'VZGPT fork keeps 2.12.0 State: in-place nested writes are not recorded'
 
 # {test file name: {test name or parametrized node name: reason}}
 KEPT_AT_2_9_0 = {
@@ -79,6 +82,38 @@ KEPT_AT_2_9_0 = {
     },
     'test_contents_branch.py': {
         'test_root_agent_excludes_tool_sub_branch_events': _SUB_BRANCH,
+    },
+    # Upstream ce2fdc5aa and 662b0175a (v2.13.0).
+    'test_state.py': {
+        name: _STATE
+        for name in (
+            'test_a_nested_write_is_recorded_only_by_the_state_that_read_it',
+            'test_a_read_hands_back_the_stored_container',
+            'test_a_recorded_container_that_cannot_be_compared_is_withdrawn',
+            'test_a_recorded_container_that_loses_its_json_form_is_withdrawn',
+            'test_a_recorded_key_assigned_again_is_not_withdrawn',
+            'test_a_value_another_writer_put_in_the_delta_is_not_withdrawn',
+            'test_a_write_after_the_delta_is_cleared_is_still_recorded',
+            'test_deleting_from_a_nested_dict_records_the_key',
+            'test_writing_far_down_a_nested_dict_records_the_key',
+            'test_writing_into_a_nested_dict_records_the_key',
+            'test_writing_into_a_nested_dict_records_the_key_under_a_schema',
+            'test_writing_into_a_nested_list_records_the_key',
+        )
+    },
+    'test_context.py': {
+        'test_actions_include_a_write_into_a_nested_state_dict': _STATE,
+    },
+    'test_base_agent.py': {
+        'test_run_async_before_agent_callback_content_carries_nested_write': (
+            _STATE
+        ),
+    },
+    'test_model_callbacks.py': {
+        'test_a_model_callback_write_into_a_nested_state_dict_is_persisted': (
+            _STATE
+        ),
+        'test_an_on_model_error_callback_nested_state_write_is_persisted': _STATE,
     },
 }
 

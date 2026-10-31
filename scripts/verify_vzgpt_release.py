@@ -24,6 +24,7 @@ import subprocess
 _ROOT = Path(__file__).resolve().parents[1]
 _SERVICE = 'src/google/adk/sessions/database_session_service.py'
 _SCHEMAS = 'src/google/adk/sessions/schemas'
+_STATE = 'src/google/adk/sessions/state.py'
 # Fork guard markers that a sync must not drop, by file.
 _REQUIRED = {
     _SERVICE: (
@@ -42,9 +43,13 @@ _REQUIRED = {
         '_VZGPT_KEEP_TOOL_SUB_BRANCH_EVENTS = True',
         '  if _VZGPT_KEEP_TOOL_SUB_BRANCH_EVENTS:\n    return False',
     ),
+    _STATE: ('VZGPT fork: a no-op that keeps the 2.12.0 session-state',),
 }
 # Destructive or serializing startup DDL from earlier incidents.
 _FORBIDDEN_IN_SERVICE = ('_SUPERSEDED_INDEX_NAMES', 'pg_advisory_xact_lock')
+# Upstream ce2fdc5aa/662b0175a: snapshot containers on read, record nested
+# writes. The fork keeps the 2.12.0 State semantics.
+_FORBIDDEN_IN_STATE = ('_snapshots', '_recorded_nested_keys', 'deepcopy')
 
 
 def _index_column(node: ast.expr) -> str:
@@ -114,6 +119,10 @@ def main() -> None:
   for forbidden in _FORBIDDEN_IN_SERVICE:
     if forbidden in service:
       raise SystemExit(f'Unsafe session initialization returned: {forbidden}')
+  state = (_ROOT / _STATE).read_text(encoding='utf-8')
+  for forbidden in _FORBIDDEN_IN_STATE:
+    if forbidden in state:
+      raise SystemExit(f'Upstream nested state tracking returned: {forbidden}')
 
   for version, expected in manifest['declared_session_indexes'].items():
     actual = _declared_indexes(_ROOT / _SCHEMAS / f'{version}.py')

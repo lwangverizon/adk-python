@@ -1,16 +1,14 @@
 # VZGPT fork baseline
 
-`vzgpt-core` targets the official **v2.12.0** release (tag commit
-`38381f65f2bee0f70a89f938ee64e51b34916fa7`), not upstream `main`. The fork
-builds as **2.12.0+vzgpt.4**. `vzgpt-release.json` records the baseline, the
+`vzgpt-core` targets the official **v2.13.0** release (tag commit
+`d68ca857d5e3bab8e968d4e5f98ef028eb37dc87`), not upstream `main`. The fork
+builds as **2.13.0+vzgpt.1**. `vzgpt-release.json` records the baseline, the
 official PyPI wheel hash, the reviewed source differences and the declared
 session indexes.
 
-All 795 Python files in the official PyPI 2.12.0 wheel are byte-identical to a
-wheel built from the tag. 2.12.0+vzgpt.3 tracked upstream `main` (121
-unreleased commits beyond 2.12.0). It was replaced because one unreleased
-change, upstream `ce2fdc5aa`, changes session-state behavior: in-place writes
-into state containers are now persisted, and containers are copied on read.
+The previous baseline was v2.12.0 (2.12.0+vzgpt.4). Upstream `ce2fdc5aa`,
+which kept 2.12.0+vzgpt.3 out of production, is part of the official v2.13.0
+release. The fork keeps the 2.12.0 session-state semantics (extension 4).
 
 ## Fork extensions
 
@@ -46,8 +44,19 @@ The built wheel differs from the official wheel only in the files listed under
    Fork tests: `tests/unittests/workflow/test_vzgpt_node_tool_compat.py` and
    `tests/unittests/flows/llm_flows/context/test_vzgpt_tool_sub_branch_history.py`.
 
+4. **Session State keeps its 2.12.0 semantics.** Upstream `ce2fdc5aa` and
+   `662b0175a` (both in v2.13.0) deep-copy every dict or list a read hands
+   out and record later in-place writes into the delta. VZGPT has about 28
+   functions that write into containers read from state in place and relies on
+   those writes not being persisted. The copy also costs about 3 ms per
+   callback for a 261 KB value. `sessions/state.py` is the v2.12.0 file plus a
+   no-op `_record_nested_writes()` that `agents/context.py` calls. Only an
+   assignment enters the delta.
+
+   Fork test: `tests/unittests/sessions/test_vzgpt_state_semantics.py`.
+
 Upstream schemas and upstream test files are not modified. Upstream tests that
-assert the newer NodeTool behavior are listed in
+assert the newer NodeTool or nested-state behavior are listed in
 `tests/unittests/_vzgpt_fork_expectations.py` and marked strict xfail by
 fork-owned `conftest.py` files, so a sync that loses a fork behavior fails the
 suite.
