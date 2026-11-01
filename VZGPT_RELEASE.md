@@ -107,33 +107,28 @@ WHERE indexrelid = 'idx_events_app_user_session_ts_id'::regclass;
 Make the `VZGPT release baseline` workflow a required check through branch
 protection.
 
-## Validation (2026-10-17)
+## Validation (2026-10-31)
 
-- The wheel differs from a wheel built from the baseline commit only in the
-  nine allowlisted files.
-- Unit tests ran in a fresh Python 3.11 environment with all extras.
-  - Full `tests/unittests -n auto`: 20,277 passed, 9 failed, 39 xfailed (19 of
-    them are the strict-xfail upstream tests listed above).
-  - Six of the 9 failures also fail on upstream `main` and depend on the local
-    machine (for example `OTEL_*` variables). The other three are
-    load-sensitive and pass in isolation.
-  - The fork tests fail without the fork changes.
-- Session tests against the extracted wheel in the VZGPT Python 3.13
-  environment (SQLAlchemy 2.0.50): 644 passed, 16 skipped. One test was
-  deselected because that environment lacks
-  `google.cloud.sqlalchemy_spanner`.
-- Local PostgreSQL 17 (temporary cluster, Unix socket only), with a schema
-  created by 2.9.0+vzgpt.2 and 6M events (1.6 GB):
-  - Starting this wheel took 0.05 s. It issued no index DDL, logged one
-    warning, and concurrent inserts stayed under 10 ms.
-  - Upstream `main` without the fork guard built the index while blocking
-    inserts. On the same data that took 27 s.
-  - `merge_state` worked on PostgreSQL, and an `append_event` from a session
-    loaded before the merge still succeeded afterwards.
-  - Rolling back to 2.9.0+vzgpt.2 on the same database issued no DDL.
-  - On an empty database the wheel created all tables with the upstream index.
-  - After an out-of-band `CREATE INDEX CONCURRENTLY`, startup issued no DDL and
-    logged no warning.
+- A wheel built from the tag matches every Python file of the official PyPI
+  2.13.0 wheel (sha256 `bec4c4ee…`). The tag build also ships 15 `README.md`
+  files that the PyPI wheel omits. The fork wheel differs from the PyPI wheel
+  in exactly the ten allowlisted Python files, and two builds of the same
+  commit produce the same bytes.
+- `scripts/verify_vzgpt_release.py` passes. The declared session indexes are
+  unchanged, and v2.13.0 changes no session schema or migration.
+- Full `tests/unittests -n 8` in fresh Python 3.11 environments, this branch
+  and the official tag side by side:
+  - The only fork-caused failures were the 22 upstream nested-state tests.
+    They are now strict xfail.
+  - Four other differences pass in isolation on both and fail only under
+    parallel load.
+  - Sessions, agents, flows, tools and workflow after the expectations:
+    7,222 passed, 45 xfailed, 0 failed.
+- The fork tests pass, and `test_vzgpt_state_semantics.py` fails on the
+  official wheel.
+- VZGPT ran the gateway-wire, runtime, rolling-deploy, rollback and
+  missing-index PostgreSQL checks against this wheel. See that repository's
+  `docs/adk-2.13.0-vzgpt1-pin-validation.md`.
 
 ## Deployment boundary
 
@@ -145,7 +140,7 @@ is performed by this branch. The VZGPT change has to handle these items:
 - `google-genai>=2.30`.
 - `google-adk[eval]` now needs `google-cloud-aiplatform>=2.2,<3`, which
   conflicts with VZGPT's `<2.0.0` override for pyvegas.
-- Upstream `main` changes the default telemetry schema to 2. The `call_llm`
+- v2.13.0 changes the default telemetry schema to 2. The `call_llm`
   span is gone and `gcp.vertex.agent.*` attributes become `gen_ai.*`. VZGPT's
   Galileo tracing depends on the legacy attributes. Set
   `ADK_TELEMETRY_SCHEMA_VERSION_OPT_IN=otel_semconv_1_36` (supported until
