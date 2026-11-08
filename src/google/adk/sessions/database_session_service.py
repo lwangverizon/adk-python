@@ -352,8 +352,10 @@ def _json_merge_set_clause(dialect_name: str) -> str | None:
   """
   if dialect_name == _POSTGRESQL_DIALECT:
     # JSONB concatenation: shallow top-level merge; an explicit JSON null is
-    # stored (key kept), matching append_event's Python dict union.
-    return "state = state || CAST(:delta AS JSONB)"
+    # stored (key kept), matching append_event's Python dict union. The column
+    # is cast first because tables created since v2.14.0 use json, which has
+    # no || operator; json and jsonb assignment-cast back to either column.
+    return "state = CAST(state AS JSONB) || CAST(:delta AS JSONB)"
   if dialect_name in (_MYSQL_DIALECT, _MARIADB_DIALECT):
     # RFC 7396: recursive merge; a JSON null deletes the key.
     return "state = JSON_MERGE_PATCH(state, CAST(:delta AS JSON))"

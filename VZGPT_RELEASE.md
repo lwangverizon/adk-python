@@ -19,6 +19,12 @@ The built wheel differs from the official wheel only in the files listed under
 1. **`merge_state`.** A state-only write API for five session services. It writes
    no events row and does not advance the session's optimistic-concurrency
    marker. Its regression tests live in `tests/unittests/sessions/`.
+   On PostgreSQL the merge casts the stored value to `jsonb` first, because
+   tables created since v2.14.0 use `json` columns, which have no `||`
+   operator (upstream `d487c5377`). The result is assignment-cast back, so it
+   works on existing `jsonb` and new `json` tables. A merged `json` row is
+   normalized the way `jsonb` normalizes it (key order, duplicate keys).
+   Fork test: `tests/unittests/sessions/test_vzgpt_merge_state_postgres.py`.
 2. **No runtime index builds on existing server-database tables.** Upstream
    `prepare_tables()` creates every missing declared index with a plain
    `CREATE INDEX`. On PostgreSQL that blocks writes to the table for the whole
@@ -120,6 +126,9 @@ protection.
   `merge_state` and stale-writer tests, the index-policy helpers next to the new
   `_begin_sqlite_write_transaction`, and the tool sub-branch guard in front of
   the new `_BranchPath.has_tool_segment_below`.
+- `merge_state` on PostgreSQL failed on a database created by v2.14.0
+  (`operator does not exist: json || jsonb`). VZGPT's isolated PostgreSQL
+  regression found it; the merge now casts the column first.
 - One new upstream test asserts that tool sub-branch events are excluded from
   the caller's history: three cases of
   `test_tool_sub_branch_event_needs_tool_segment_below_branch` are strict xfail.

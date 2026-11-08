@@ -31,6 +31,7 @@ _REQUIRED = {
         '_RUNTIME_INDEX_DDL_DIALECTS = frozenset({_SQLITE_DIALECT})',
         'if connection.dialect.name not in _RUNTIME_INDEX_DDL_DIALECTS:',
         'async def merge_state(',
+        'state = CAST(state AS JSONB) || CAST(:delta AS JSONB)',
     ),
     'src/google/adk/tools/_node_tool.py': (
         "return f'Error validating input for node: {e}'",
