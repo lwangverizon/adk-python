@@ -30,7 +30,9 @@ import pytest
 _NODE_TOOL = 'VZGPT fork keeps 2.9.0 NodeTool result behavior'
 _SUB_BRANCH = 'VZGPT fork keeps tool sub-branch events in caller history'
 _ENTRY_ARGS = 'test_node_tool_workflow_entry_args_are_validated_before_run'
-_STATE = 'VZGPT fork keeps 2.12.0 State: in-place nested writes are not recorded'
+_STATE = (
+    'VZGPT fork keeps 2.12.0 State: in-place nested writes are not recorded'
+)
 
 # {test file name: {test name or parametrized node name: reason}}
 KEPT_AT_2_9_0 = {
@@ -84,8 +86,9 @@ KEPT_AT_2_9_0 = {
         'test_root_agent_excludes_tool_sub_branch_events': _SUB_BRANCH,
         # v2.14.0: only the cases that expect a tool sub-branch match.
         **{
-            'test_tool_sub_branch_event_needs_tool_segment_below_branch'
-            f'[{case}]': _SUB_BRANCH
+            f'test_tool_sub_branch_event_needs_tool_segment_below_branch[{case}]': (
+                _SUB_BRANCH
+            )
             for case in (
                 'root-root.tool@fc-tool_call_ids0-True',
                 'root-root.tool@fc.node@1-tool_call_ids1-True',
@@ -123,7 +126,9 @@ KEPT_AT_2_9_0 = {
         'test_a_model_callback_write_into_a_nested_state_dict_is_persisted': (
             _STATE
         ),
-        'test_an_on_model_error_callback_nested_state_write_is_persisted': _STATE,
+        'test_an_on_model_error_callback_nested_state_write_is_persisted': (
+            _STATE
+        ),
     },
 }
 
