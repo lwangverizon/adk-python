@@ -1,14 +1,15 @@
 # VZGPT fork baseline
 
-`vzgpt-core` targets the official **v2.13.0** release (tag commit
-`d68ca857d5e3bab8e968d4e5f98ef028eb37dc87`), not upstream `main`. The fork
-builds as **2.13.0+vzgpt.1**. `vzgpt-release.json` records the baseline, the
+`vzgpt-core` targets the official **v2.14.0** release (tag commit
+`93814c3475916bf873236f4e30f6915b4b9c8698`), not upstream `main`. The fork
+builds as **2.14.0+vzgpt.1**. `vzgpt-release.json` records the baseline, the
 official PyPI wheel hash, the reviewed source differences and the declared
 session indexes.
 
-The previous baseline was v2.12.0 (2.12.0+vzgpt.4). Upstream `ce2fdc5aa`,
-which kept 2.12.0+vzgpt.3 out of production, is part of the official v2.13.0
-release. The fork keeps the 2.12.0 session-state semantics (extension 4).
+The previous baseline was v2.13.0 (2.13.0+vzgpt.1). The five fork extensions
+below are reapplied on v2.14.0 unchanged in behavior. Upstream `ce2fdc5aa` and
+`662b0175a` are still part of v2.14.0, so the fork keeps the 2.12.0
+session-state semantics (extension 4).
 
 ## Fork extensions
 
@@ -107,33 +108,25 @@ WHERE indexrelid = 'idx_events_app_user_session_ts_id'::regclass;
 Make the `VZGPT release baseline` workflow a required check through branch
 protection.
 
-## Validation (2026-10-17)
+## Validation (2026-11-08)
 
-- The wheel differs from a wheel built from the baseline commit only in the
-  nine allowlisted files.
-- Unit tests ran in a fresh Python 3.11 environment with all extras.
-  - Full `tests/unittests -n auto`: 20,277 passed, 9 failed, 39 xfailed (19 of
-    them are the strict-xfail upstream tests listed above).
-  - Six of the 9 failures also fail on upstream `main` and depend on the local
-    machine (for example `OTEL_*` variables). The other three are
-    load-sensitive and pass in isolation.
-  - The fork tests fail without the fork changes.
-- Session tests against the extracted wheel in the VZGPT Python 3.13
-  environment (SQLAlchemy 2.0.50): 644 passed, 16 skipped. One test was
-  deselected because that environment lacks
-  `google.cloud.sqlalchemy_spanner`.
-- Local PostgreSQL 17 (temporary cluster, Unix socket only), with a schema
-  created by 2.9.0+vzgpt.2 and 6M events (1.6 GB):
-  - Starting this wheel took 0.05 s. It issued no index DDL, logged one
-    warning, and concurrent inserts stayed under 10 ms.
-  - Upstream `main` without the fork guard built the index while blocking
-    inserts. On the same data that took 27 s.
-  - `merge_state` worked on PostgreSQL, and an `append_event` from a session
-    loaded before the merge still succeeded afterwards.
-  - Rolling back to 2.9.0+vzgpt.2 on the same database issued no DDL.
-  - On an empty database the wheel created all tables with the upstream index.
-  - After an out-of-band `CREATE INDEX CONCURRENTLY`, startup issued no DDL and
-    logged no warning.
+- A wheel built from the tag matches every Python file of the official PyPI
+  2.14.0 wheel (sha256 `f7d8c79b…`, 830 Python files). The tag build also ships
+  `README.md` files that the PyPI wheel omits. The fork wheel differs from the
+  PyPI wheel in exactly the ten allowlisted Python files.
+- `scripts/verify_vzgpt_release.py` passes. The declared session indexes are
+  unchanged, and v2.14.0 adds no session migration.
+- Reapplying the extensions on v2.14.0 needed three manual merges: the
+  `merge_state` and stale-writer tests, the index-policy helpers next to the new
+  `_begin_sqlite_write_transaction`, and the tool sub-branch guard in front of
+  the new `_BranchPath.has_tool_segment_below`.
+- One new upstream test asserts that tool sub-branch events are excluded from
+  the caller's history: three cases of
+  `test_tool_sub_branch_event_needs_tool_segment_below_branch` are strict xfail.
+- Full `tests/unittests -n 10` in a fresh Python 3.11 environment: 23,089
+  passed, 58 xfailed, 25 failed. All 25 (telemetry setup, functional schema and
+  instrumentation tests and one BigQuery plugin drain test) pass when rerun with
+  the shell's `OTEL_*` variables unset: 1,082 passed, 3 xfailed.
 
 ## Deployment boundary
 
@@ -141,16 +134,23 @@ Updating this branch does not change VZGPT's vendored wheel or running images.
 Adopting the wheel is a separate, reviewed VZGPT change. No database operation
 is performed by this branch. The VZGPT change has to handle these items:
 
-- The pin, hash and lock for the new wheel.
-- `google-genai>=2.30`.
-- `google-adk[eval]` now needs `google-cloud-aiplatform>=2.2,<3`, which
+- The pin, hash and lock for the new wheel. v2.14.0 only widens the
+  `opentelemetry-api`/`-sdk` ceiling to `<=1.45.2`; no other core dependency
+  changes.
+- **PostgreSQL JSON columns (upstream `d487c5377`).** `DynamicJSON` now creates
+  `json` instead of `jsonb` columns. Existing `jsonb` tables are not altered
+  and still read and write. Only a table created by this wheel on an empty
+  database is `json`. Queries outside ADK that use jsonb-only operators or GIN
+  indexes on ADK tables would not work on such a table.
+- Bytes in session state are now stored as base64 (upstream `d91dd34e8`,
+  `73dca84ef`) instead of failing to serialize.
+- `google-adk[eval]` still needs `google-cloud-aiplatform>=2.2,<3`, which
   conflicts with VZGPT's `<2.0.0` override for pyvegas.
-- Upstream `main` changes the default telemetry schema to 2. The `call_llm`
-  span is gone and `gcp.vertex.agent.*` attributes become `gen_ai.*`. VZGPT's
-  Galileo tracing depends on the legacy attributes. Set
+- The default telemetry schema is 2. VZGPT's Galileo tracing depends on the
+  legacy attributes and keeps
   `ADK_TELEMETRY_SCHEMA_VERSION_OPT_IN=otel_semconv_1_36` (supported until
-  2027-03-31) or migrate the tracing first.
+  2027-03-31). v2.14.0 records the aggregated answer of a streamed model call
+  on its span instead of the chunks (upstream `80a44111c`).
 - Before rollout, confirm in each environment that VZGPT's own indexes on ADK
   tables (for example `idx_sessions_app_id_update_time`) already exist. This
-  wheel no longer builds them on existing tables.
-- Re-test the skill lifecycle APIs that 2.9.0+vzgpt.2 deliberately omitted.
+  wheel does not build them on existing tables.

@@ -82,6 +82,16 @@ KEPT_AT_2_9_0 = {
     },
     'test_contents_branch.py': {
         'test_root_agent_excludes_tool_sub_branch_events': _SUB_BRANCH,
+        # v2.14.0: only the cases that expect a tool sub-branch match.
+        **{
+            'test_tool_sub_branch_event_needs_tool_segment_below_branch'
+            f'[{case}]': _SUB_BRANCH
+            for case in (
+                'root-root.tool@fc-tool_call_ids0-True',
+                'root-root.tool@fc.node@1-tool_call_ids1-True',
+                'None-tool@fc-tool_call_ids2-True',
+            )
+        },
     },
     # Upstream ce2fdc5aa and 662b0175a (v2.13.0).
     'test_state.py': {

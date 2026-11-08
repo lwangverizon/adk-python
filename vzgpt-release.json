@@ -1,9 +1,9 @@
 {
   "upstream_repository": "https://github.com/google/adk-python.git",
-  "upstream_tag": "v2.13.0",
-  "upstream_commit": "d68ca857d5e3bab8e968d4e5f98ef028eb37dc87",
-  "official_wheel_sha256": "bec4c4ee0aa3e63a2243c23365c5aef666ea539bc48c78dfbbf004dbddfc5f00",
-  "version": "2.13.0+vzgpt.1",
+  "upstream_tag": "v2.14.0",
+  "upstream_commit": "93814c3475916bf873236f4e30f6915b4b9c8698",
+  "official_wheel_sha256": "f7d8c79bafc4f9215402219c9542db0bde702952448a09ffd51c5bd22b135b0e",
+  "version": "2.14.0+vzgpt.1",
   "sync_policy": "Explicit official release tags only; never merge upstream/main. Update this manifest and run scripts/verify_vzgpt_release.py.",
   "allowed_source_differences": [
     "src/google/adk/version.py",
@@ -47,6 +47,6 @@
     "NodeTool failures and invalid input are returned to the model as in 2.9.0.",
     "NodeTool results with skip_summarization are not appended as visible text.",
     "Tool sub-branch events stay in the calling agent's history as in 2.9.0.",
-    "Session State keeps the 2.12.0 semantics: no container snapshots on read and no implicit recording of in-place nested writes (upstream ce2fdc5aa, 662b0175a)."
+    "Session State keeps the 2.12.0 semantics: no container snapshots on read and no implicit recording of in-place nested writes (upstream ce2fdc5aa, 662b0175a; still part of v2.14.0)."
   ]
 }
